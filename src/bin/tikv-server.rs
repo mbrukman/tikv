@@ -36,6 +36,7 @@ extern crate signal;
 extern crate nix;
 extern crate prometheus;
 extern crate sys_info;
+extern crate futures;
 extern crate tokio_core;
 #[cfg(test)]
 extern crate tempdir;
@@ -57,6 +58,7 @@ use rocksdb::{DB, Options as RocksdbOptions, BlockBasedOptions};
 use mio::EventLoop;
 use fs2::FileExt;
 use sys_info::{cpu_num, mem_info};
+use futures::sync::oneshot;
 use tokio_core::reactor::Core;
 
 use tikv::storage::{Storage, TEMP_DIR, CF_DEFAULT, CF_LOCK, CF_WRITE, CF_RAFT};
@@ -788,19 +790,23 @@ fn get_store_labels(matches: &Matches, config: &toml::Value) -> HashMap<String, 
 
 fn start_server<T, S>(mut server: Server<T, S>,
                       mut el: EventLoop<Server<T, S>>,
+                      mut core: Core,
                       engine: Arc<DB>,
                       backup_path: &str)
     where T: RaftStoreRouter,
           S: StoreAddrResolver + Send + 'static
 {
     let ch = server.get_sendch();
+    let (tx, rx) = oneshot::channel();
     let h = thread::Builder::new()
         .name("tikv-eventloop".to_owned())
         .spawn(move || {
             server.run(&mut el).unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
+            tx.send(()).unwrap();
         })
         .unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
     signal_handler::handle_signal(ch, engine, backup_path);
+    core.run(rx).unwrap();
     h.join().unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
 }
 
@@ -842,14 +848,14 @@ fn run_raft_server(pd_client: RpcClient,
         snapshot_status_sender: node.get_snapshot_status_sender(),
     };
     let svr = Server::new(&mut event_loop,
-                          &mut core,
+                          core.remote(),
                           &cfg,
                           store,
                           server_chan,
                           resolver,
                           snap_mgr)
         .unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
-    start_server(svr, event_loop, engine, backup_path);
+    start_server(svr, event_loop, core, engine, backup_path);
     node.stop().unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
 }
 

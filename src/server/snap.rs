@@ -15,8 +15,6 @@ use std::fmt::{self, Formatter, Display};
 use std::io;
 use std::iter::Iterator;
 use std::net::SocketAddr;
-use std::collections::hash_map::Entry;
-use std::io::Read;
 use std::boxed::FnBox;
 use std::time::Instant;
 use std::result;

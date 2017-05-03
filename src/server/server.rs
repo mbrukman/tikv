@@ -19,7 +19,7 @@ use std::net::{SocketAddr, IpAddr};
 use std::str::FromStr;
 use futures::sync::mpsc;
 use futures::{Stream, Future, Sink};
-use tokio_core::reactor::{Handle as CoreHandle, Core};
+use tokio_core::reactor::{Handle as CoreHandle, Remote as RemoteCore};
 use mio::{Handler, EventLoop, EventLoopConfig};
 use grpc::{Server as GrpcServer, ServerBuilder, Environment, ChannelBuilder};
 use kvproto::tikvpb_grpc::*;
@@ -27,11 +27,9 @@ use kvproto::raft_serverpb::*;
 use util::worker::{Stopped, Worker};
 use util::worker::{FutureWorker, FutureRunnable};
 use util::transport::SendCh;
-use util::{HashMap, HashSet};
 use storage::Storage;
 use raftstore::store::{SnapshotStatusMsg, SnapManager};
 use raft::SnapshotStatus;
-use util::sockopt::SocketOpt;
 use util::collections::{HashMap, HashSet};
 
 use super::coprocessor::{EndPointTask, EndPointHost};
@@ -90,7 +88,7 @@ pub struct Server<T: RaftStoreRouter + 'static, S: StoreAddrResolver> {
 impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
     // Create a server with already initialized engines.
     pub fn new(event_loop: &mut EventLoop<Self>,
-               core: &mut Core,
+               core: RemoteCore,
                cfg: &Config,
                storage: Storage,
                ch: ServerChannel<T>,
@@ -102,8 +100,7 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
         let snap_worker = Worker::new("snap-handler");
         let raft_msg_worker = FutureWorker::new("raft-msg-worker");
 
-        let remote = core.remote();
-        let h = Handle::new(remote,
+        let h = Handle::new(core,
                             storage.clone(),
                             end_point_worker.scheduler(),
                             ch.raft_router.clone(),

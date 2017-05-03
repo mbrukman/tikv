@@ -31,6 +31,8 @@ use util::{HashMap, HashSet};
 use storage::Storage;
 use raftstore::store::{SnapshotStatusMsg, SnapManager};
 use raft::SnapshotStatus;
+use util::sockopt::SocketOpt;
+use util::collections::{HashMap, HashSet};
 
 use super::coprocessor::{EndPointTask, EndPointHost};
 use super::{Msg, ConnData};

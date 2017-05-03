@@ -11,66 +11,114 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::result;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Instant;
 use std::time::Duration;
-use std::thread;
+use std::collections::HashSet;
 
-use futures::Future;
+use futures::{Future, BoxFuture};
 use futures::future::ok;
-use futures::future::{self, loop_fn, Loop};
+use futures::future::{loop_fn, Loop};
 
-use kvproto::pdpb::GetMembersResponse;
-use kvproto::pdpb_grpc::PDAsyncClient;
+use tokio_timer::Timer;
+
+use grpc::{Environment, ChannelBuilder, Result as GrpcResult};
+use rand::{self, Rng};
+
+use kvproto::pdpb::{ResponseHeader, ErrorType, GetMembersRequest, GetMembersResponse, Member};
+use kvproto::pdpb_grpc::PDClient;
 
 use util::HandyRwLock;
 
-use super::super::PdFuture;
-use super::super::Result;
-use super::client::try_connect_leader;
+use super::super::{Result, Error, PdFuture};
+use super::super::metrics::PD_SEND_MSG_HISTOGRAM;
 
 pub struct Inner {
-    pub client: PDAsyncClient,
-    pub members: GetMembersResponse,
+    env: Arc<Environment>,
+    client: PDClient,
+    members: GetMembersResponse,
+
+    last_update: Instant,
 }
+
+unsafe impl Send for Inner {}
+unsafe impl Sync for Inner {}
 
 /// A leader client doing requests asynchronous.
 pub struct LeaderClient {
-    pub inner: Arc<RwLock<Inner>>,
+    inner: Arc<RwLock<Inner>>,
 }
 
 impl LeaderClient {
-    pub fn new(client: PDAsyncClient, members: GetMembersResponse) -> LeaderClient {
+    pub fn new(env: Arc<Environment>,
+               client: PDClient,
+               members: GetMembersResponse)
+               -> LeaderClient {
         LeaderClient {
             inner: Arc::new(RwLock::new(Inner {
+                env: env,
                 client: client,
                 members: members,
+
+                last_update: Instant::now(),
             })),
         }
     }
 
     pub fn request<Req, Resp, F>(&self, req: Req, f: F, retry: usize) -> Request<Req, Resp, F>
         where Req: Clone + 'static,
-              F: FnMut(&PDAsyncClient, Req) -> PdFuture<Resp> + Send + 'static
+              F: FnMut(&PDClient, Req) -> PdFuture<Resp> + Send + 'static
     {
         Request {
             reconnect_count: retry,
             request_sent: 0,
-            inner: self.inner.clone(),
+            timer: Timer::default(),
+            client: LeaderClient { inner: self.inner.clone() },
             req: req,
             resp: None,
             func: f,
         }
     }
+
+    pub fn get_leader(&self) -> Member {
+        self.inner.rl().members.get_leader().clone()
+    }
+
+    // Re-establish connection with PD leader in synchronized fashion.
+    pub fn reconnect(&self) -> Result<()> {
+        let ((client, members), start) = {
+            let inner = self.inner.rl();
+            if inner.last_update.elapsed() < Duration::from_secs(RECONNECT_INTERVAL_SEC) {
+                // Avoid unnecessary updating.
+                return Ok(());
+            }
+
+            let start = Instant::now();
+            (try!(try_connect_leader(inner.env.clone(), &inner.members)), start)
+        };
+
+        {
+            let mut inner = self.inner.wl();
+            inner.client = client;
+            inner.members = members;
+            inner.last_update = Instant::now();
+        }
+        warn!("updating PD client done, spent {:?}", start.elapsed());
+        Ok(())
+    }
 }
+
+const RECONNECT_INTERVAL_SEC: u64 = 1; // 1s
 
 /// The context of sending requets.
 pub struct Request<Req, Resp, F> {
     reconnect_count: usize,
     request_sent: usize,
+    timer: Timer,
 
-    inner: Arc<RwLock<Inner>>,
+    client: LeaderClient,
 
     req: Req,
     resp: Option<Result<Resp>>,
@@ -82,68 +130,69 @@ const MAX_REQUEST_COUNT: usize = 5;
 impl<Req, Resp, F> Request<Req, Resp, F>
     where Req: Clone + Send + 'static,
           Resp: Send + 'static,
-          F: FnMut(&PDAsyncClient, Req) -> PdFuture<Resp> + Send + 'static
+          F: FnMut(&PDClient, Req) -> PdFuture<Resp> + Send + 'static
 {
-    // Re-establish connection with PD leader in synchronized fashion.
-    fn reconnect_if_needed(mut self) -> PdFuture<Self> {
+    fn reconnect_if_needed(mut self) -> BoxFuture<Self, Self> {
         debug!("reconnect remains: {}", self.reconnect_count);
 
-        if self.request_sent == 0 {
-            return ok(self).boxed();
-        }
-
         if self.request_sent < MAX_REQUEST_COUNT {
-            debug!("retry on the same client");
             return ok(self).boxed();
         }
 
         // Updating client.
-
-        self.request_sent = 0;
         self.reconnect_count -= 1;
 
         // FIXME: should not block the core.
         warn!("updating PD client, block the tokio core");
-
-        let start = Instant::now();
-        let members = self.inner.rl().members.clone();
-        match try_connect_leader(&members) {
-            Ok((client, members)) => {
-                let mut inner = self.inner.wl();
-                if members != inner.members {
-                    inner.client = client;
-                    inner.members = members;
-                }
-                warn!("updating PD client done, spent {:?}", start.elapsed());
+        match self.client.reconnect() {
+            Ok(_) => {
+                self.request_sent = 0;
+                ok(self).boxed()
             }
-
-            Err(err) => {
-                warn!("updating PD client spent {:?}, err {:?}",
-                      start.elapsed(),
-                      err);
-                // FIXME: use tokio-timer instead.
-                thread::sleep(Duration::from_secs(1));
+            Err(_) => {
+                self.timer
+                    .sleep(Duration::from_secs(RECONNECT_INTERVAL_SEC))
+                    .then(|_| Err(self))
+                    .boxed()
             }
         }
-
-        ok(self).boxed()
     }
 
-    fn send(mut self) -> PdFuture<Self> {
+    fn send_and_receive(mut self) -> BoxFuture<Self, Self> {
         self.request_sent += 1;
         debug!("request sent: {}", self.request_sent);
         let r = self.req.clone();
-        let req = (self.func)(&self.inner.rl().client, r);
+        let req = (self.func)(&self.client.inner.rl().client, r);
         req.then(|resp| {
                 match resp {
-                    Ok(resp) => self.resp = Some(Ok(resp)),
+                    Ok(resp) => {
+                        self.resp = Some(Ok(resp));
+                        Ok(self)
+                    }
                     Err(err) => {
                         error!("request failed: {:?}", err);
+                        Err(self)
                     }
-                };
-                ok(self)
+                }
             })
             .boxed()
+    }
+
+    fn break_or_continue(ctx: result::Result<Self, Self>) -> Result<Loop<Self, Self>> {
+        let ctx = match ctx {
+            Ok(ctx) | Err(ctx) => ctx,
+        };
+        let done = ctx.reconnect_count == 0 || ctx.resp.is_some();
+        if done {
+            Ok(Loop::Break(ctx))
+        } else {
+            Ok(Loop::Continue(ctx))
+        }
+    }
+
+    fn post_loop(ctx: Result<Self>) -> Result<Resp> {
+        let ctx = ctx.expect("end loop with Ok(_)");
+        ctx.resp.unwrap_or_else(|| Err(box_err!("fail to request")))
     }
 
     /// Returns a Future, it is resolves once a future returned by the closure
@@ -152,24 +201,157 @@ impl<Req, Resp, F> Request<Req, Resp, F>
         let ctx = self;
         loop_fn(ctx, |ctx| {
                 ctx.reconnect_if_needed()
-                    .and_then(|ctx| ctx.send())
-                    .and_then(|ctx| {
-                        let done = ctx.reconnect_count == 0 || ctx.resp.is_some();
-                        if done {
-                            Ok(Loop::Break(ctx))
-                        } else {
-                            Ok(Loop::Continue(ctx))
-                        }
-                    })
+                    .and_then(Self::send_and_receive)
+                    .then(Self::break_or_continue)
             })
-            .then(|ctx| {
-                let ctx = ctx.expect("end loop with Ok(_)");
-                match ctx.resp {
-                    Some(Ok(resp)) => future::ok(resp),
-                    Some(Err(err)) => future::err(err),
-                    None => future::err(box_err!("fail to request")),
-                }
-            })
+            .then(Self::post_loop)
             .boxed()
+    }
+}
+
+/// Do a request in synchronized fashion.
+pub fn sync_request<F, R>(client: &LeaderClient, retry: usize, func: F) -> Result<R>
+    where F: Fn(&PDClient) -> GrpcResult<R>
+{
+    for _ in 0..retry {
+        let r = {
+            let _timer = PD_SEND_MSG_HISTOGRAM.start_timer(); // observe on dropping.
+            func(&client.inner.rl().client).map_err(Error::Grpc)
+        };
+
+        match r {
+            Ok(r) => {
+                return Ok(r);
+            }
+            Err(e) => {
+                error!("fail to request: {:?}", e);
+                if let Err(e) = client.reconnect() {
+                    error!("fail to reconnect: {:?}", e);
+                }
+            }
+        }
+    }
+
+    Err(box_err!("fail to request"))
+}
+
+pub fn validate_endpoints(env: Arc<Environment>,
+                          endpoints: &[String])
+                          -> Result<(PDClient, GetMembersResponse)> {
+    if endpoints.is_empty() {
+        return Err(box_err!("empty PD endpoints"));
+    }
+
+    let len = endpoints.len();
+    let mut endpoints_set = HashSet::with_capacity(len);
+
+    let mut members = None;
+    let mut cluster_id = None;
+    for ep in endpoints {
+        if !endpoints_set.insert(ep) {
+            return Err(box_err!("duplicate PD endpoint {}", ep));
+        }
+
+        let (_, resp) = match connect(env.clone(), ep) {
+            Ok(resp) => resp,
+            // Ignore failed PD node.
+            Err(e) => {
+                error!("PD endpoint {} failed to respond: {:?}", ep, e);
+                continue;
+            }
+        };
+
+        // Check cluster ID.
+        let cid = resp.get_header().get_cluster_id();
+        if let Some(sample) = cluster_id {
+            if sample != cid {
+                return Err(box_err!("PD response cluster_id mismatch, want {}, got {}",
+                                    sample,
+                                    cid));
+            }
+        } else {
+            cluster_id = Some(cid);
+        }
+        // TODO: check all fields later?
+
+        if members.is_none() {
+            members = Some(resp);
+        }
+    }
+
+    match members {
+        Some(members) => {
+            let (client, members) = try!(try_connect_leader(env.clone(), &members));
+            info!("All PD endpoints are consistent: {:?}", endpoints);
+            Ok((client, members))
+        }
+        _ => Err(box_err!("PD cluster failed to respond")),
+    }
+}
+
+fn connect(env: Arc<Environment>, addr: &str) -> Result<(PDClient, GetMembersResponse)> {
+    debug!("connect to PD endpoint: {:?}", addr);
+    let addr = if addr.starts_with("http://") {
+        &addr[7..]
+    } else {
+        addr
+    };
+    let channel = ChannelBuilder::new(env).connect(addr);
+    let client = PDClient::new(channel);
+    match client.get_members(GetMembersRequest::new()) {
+        Ok(resp) => Ok((client, resp)),
+        Err(e) => Err(Error::Grpc(e)),
+    }
+}
+
+pub fn try_connect_leader(env: Arc<Environment>,
+                          previous: &GetMembersResponse)
+                          -> Result<(PDClient, GetMembersResponse)> {
+    // Try to connect other members.
+    // Randomize endpoints.
+    let members = previous.get_members();
+    let mut indexes: Vec<usize> = (0..members.len()).collect();
+    rand::thread_rng().shuffle(&mut indexes);
+
+    let mut resp = None;
+    'outer: for i in indexes {
+        for ep in members[i].get_client_urls() {
+            match connect(env.clone(), ep.as_str()) {
+                Ok((_, r)) => {
+                    resp = Some(r);
+                    break 'outer;
+                }
+                Err(e) => {
+                    error!("failed to connect to {}, {:?}", ep, e);
+                    continue;
+                }
+            }
+        }
+    }
+
+    // Then try to connect the PD cluster leader.
+    if let Some(resp) = resp {
+        let leader = resp.get_leader().clone();
+        for ep in leader.get_client_urls() {
+            if let Ok((client, _)) = connect(env.clone(), ep.as_str()) {
+                info!("connect to PD leader {:?}", ep);
+                return Ok((client, resp));
+            }
+        }
+    }
+
+    Err(box_err!("failed to connect to {:?}", members))
+}
+
+pub fn check_resp_header(header: &ResponseHeader) -> Result<()> {
+    if !header.has_error() {
+        return Ok(());
+    }
+    // TODO: translate more error types
+    let err = header.get_error();
+    match err.get_field_type() {
+        ErrorType::ALREADY_BOOTSTRAPPED => Err(Error::ClusterBootstrapped(header.get_cluster_id())),
+        ErrorType::NOT_BOOTSTRAPPED => Err(Error::ClusterNotBootstrapped(header.get_cluster_id())),
+        _ => Err(box_err!(err.get_message())),
     }
 }

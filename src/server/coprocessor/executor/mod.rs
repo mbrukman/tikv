@@ -11,8 +11,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod client;
-mod util;
+use util::codec::table::RowColsDict;
+use server::coprocessor::Result;
 
-pub use self::client::RpcClient;
-pub use self::util::validate_endpoints;
+#[allow(dead_code)] //TODO:remove it
+pub struct Row {
+    pub handle: i64,
+    pub data: RowColsDict,
+}
+
+#[allow(dead_code)] //TODO:remove it
+impl Row {
+    pub fn new(handle: i64, data: RowColsDict) -> Row {
+        Row {
+            handle: handle,
+            data: data,
+        }
+    }
+}
+
+pub trait Executor {
+    fn next(&mut self) -> Result<Option<Row>>;
+}

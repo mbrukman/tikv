@@ -16,6 +16,7 @@ use std::io;
 use std::iter::Iterator;
 use std::net::SocketAddr;
 use std::collections::hash_map::Entry;
+use std::io::Read;
 use std::boxed::FnBox;
 use std::time::Instant;
 use std::result;
@@ -33,7 +34,7 @@ use kvproto::tikvpb_grpc::TikvClient;
 use raftstore::store::{SnapManager, SnapKey, SnapEntry, Snapshot};
 use util::worker::Runnable;
 use util::buf::PipeBuffer;
-use util::HashMap;
+use util::collections::{HashMap, HashMapEntry as Entry};
 use util::transport::SendCh;
 
 use super::metrics::*;

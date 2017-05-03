@@ -12,15 +12,16 @@
 // limitations under the License.
 
 use std::fmt;
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::boxed::Box;
-use std::net::SocketAddr;
-use futures::{future, Stream, Future};
+use std::net::{SocketAddr, IpAddr};
+use std::str::FromStr;
 use futures::sync::mpsc;
-use tokio_core::reactor::Handle as CoreHandle;
+use futures::{Stream, Future, Sink};
+use tokio_core::reactor::{Handle as CoreHandle, Core};
 use mio::{Handler, EventLoop, EventLoopConfig};
-use grpc::error::GrpcError;
-use grpc::server::GrpcServerConf;
+use grpc::{Server as GrpcServer, ServerBuilder, Environment, ChannelBuilder};
 use kvproto::tikvpb_grpc::*;
 use kvproto::raft_serverpb::*;
 use util::worker::{Stopped, Worker};
@@ -31,13 +32,16 @@ use storage::Storage;
 use raftstore::store::{SnapshotStatusMsg, SnapManager};
 use raft::SnapshotStatus;
 
+use super::coprocessor::{EndPointTask, EndPointHost};
 use super::{Msg, ConnData};
-use super::{Result, Config};
+use super::{Result, Config, Error};
 use super::handle::Handle;
 use super::transport::RaftStoreRouter;
 use super::resolve::StoreAddrResolver;
 use super::snap::{Task as SnapTask, Runner as SnapHandler};
 use super::metrics::*;
+
+const DEFAULT_COPROCESSOR_BATCH: usize = 50;
 
 pub fn create_event_loop<T, S>(config: &Config) -> Result<EventLoop<Server<T, S>>>
     where T: RaftStoreRouter,
@@ -57,33 +61,34 @@ pub struct ServerChannel<T: RaftStoreRouter + 'static> {
 }
 
 pub struct Server<T: RaftStoreRouter + 'static, S: StoreAddrResolver> {
+    // Channel for sending eventloop messages.
     sendch: SendCh<Msg>,
-
-    grpc_server: Option<TiKVAsyncServer>,
+    // Grpc server.
+    env: Arc<Environment>,
+    grpc_server: GrpcServer,
     local_addr: SocketAddr,
-
-    // store id -> addr
-    // This is for communicating with other raft stores.
+    // Addrs map for communicating with other raft stores.
     store_addrs: HashMap<u64, SocketAddr>,
     store_resolving: HashSet<u64>,
-
+    resolver: S,
+    // For dispatch raft message.
     ch: ServerChannel<T>,
-
+    // The kv storage.
+    storage: Storage,
+    // For handling coprocessor requests.
+    end_point_worker: Worker<EndPointTask>,
+    end_point_concurrency: usize,
+    // For sending/receiving snapshots.
     snap_mgr: SnapManager,
     snap_worker: Worker<SnapTask>,
-
+    // For sending raft messages to other stores.
     raft_msg_worker: FutureWorker<SendTask>,
-
-    resolver: S,
 }
 
 impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
     // Create a server with already initialized engines.
-    // Now some tests use 127.0.0.1:0 but we need real listening
-    // address in Node before creating the Server, so we first
-    // create the listener outer, get the real listening address for
-    // Node and then pass it here.
     pub fn new(event_loop: &mut EventLoop<Self>,
+               core: &mut Core,
                cfg: &Config,
                storage: Storage,
                ch: ServerChannel<T>,
@@ -91,31 +96,46 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
                snap_mgr: SnapManager)
                -> Result<Server<T, S>> {
         let sendch = SendCh::new(event_loop.channel(), "raft-server");
+        let end_point_worker = Worker::new("end-point-worker");
         let snap_worker = Worker::new("snap-handler");
         let raft_msg_worker = FutureWorker::new("raft-msg-worker");
 
-        let mut h = Handle::new(storage,
-                                cfg.end_point_concurrency,
-                                ch.raft_router.clone(),
-                                snap_worker.scheduler());
-        try!(h.run());
-        let mut conf = GrpcServerConf::default();
-        conf.http.no_delay = Some(true);
-        conf.http.thread_name = Some("grpc-server".to_owned());
-        let grpc_server = TiKVAsyncServer::new(cfg.addr.to_owned(), conf, h);
-        let addr = grpc_server.local_addr().to_owned();
+        let remote = core.remote();
+        let h = Handle::new(remote,
+                            storage.clone(),
+                            end_point_worker.scheduler(),
+                            ch.raft_router.clone(),
+                            snap_worker.scheduler());
+        let env = Arc::new(Environment::new(1));
+        let s = create_tikv_service(h);
+        let addr = try!(SocketAddr::from_str(&cfg.addr));
+        let ip = format!("{}", addr.ip());
+        let mut grpc_server = ServerBuilder::new(env.clone())
+            .register_service(s)
+            .bind(ip, addr.port() as u32)
+            .build();
+        grpc_server.start();
+
+        let addr = {
+            let (ref host, port) = grpc_server.bind_addrs()[0];
+            SocketAddr::new(try!(IpAddr::from_str(host)), port as u16)
+        };
 
         let svr = Server {
             sendch: sendch,
-            grpc_server: Some(grpc_server),
+            env: env,
+            grpc_server: grpc_server,
             local_addr: addr,
             store_addrs: HashMap::default(),
             store_resolving: HashSet::default(),
+            resolver: resolver,
             ch: ch,
+            storage: storage,
+            end_point_worker: end_point_worker,
+            end_point_concurrency: cfg.end_point_concurrency,
             snap_mgr: snap_mgr,
             snap_worker: snap_worker,
             raft_msg_worker: raft_msg_worker,
-            resolver: resolver,
         };
 
         Ok(svr)
@@ -125,7 +145,11 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
         let ch = self.get_sendch();
         let snap_runner = SnapHandler::new(self.snap_mgr.clone(), self.ch.raft_router.clone(), ch);
         box_try!(self.snap_worker.start(snap_runner));
-        box_try!(self.raft_msg_worker.start(SendRunner::new()));
+        box_try!(self.raft_msg_worker.start(SendRunner::new(self.env.clone())));
+        let end_point = EndPointHost::new(self.storage.get_engine(),
+                                          self.end_point_worker.scheduler(),
+                                          self.end_point_concurrency);
+        box_try!(self.end_point_worker.start_batch(end_point, DEFAULT_COPROCESSOR_BATCH));
 
         info!("TiKV is ready to serve");
 
@@ -297,7 +321,7 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver> Handler for Server<T, S> {
         if !el.is_running() {
             self.snap_worker.stop();
             self.raft_msg_worker.stop();
-            self.grpc_server.take();
+            self.grpc_server.shutdown();
         }
     }
 }
@@ -348,17 +372,20 @@ impl fmt::Display for SendTask {
 }
 
 struct Conn {
-    _client: TiKVAsyncClient,
+    _client: TikvClient,
     stream: mpsc::UnboundedSender<RaftMessage>,
 }
 
 impl Conn {
-    fn new(addr: SocketAddr, handle: &CoreHandle) -> Result<Conn> {
-        let host = format!("{}", addr.ip());
-        let client = box_try!(TiKVAsyncClient::new(&*host, addr.port(), false, Default::default()));
+    fn new(env: Arc<Environment>, addr: SocketAddr, handle: &CoreHandle) -> Result<Conn> {
+        let channel = ChannelBuilder::new(env).connect(&format!("{}", addr));
+        let client = TikvClient::new(channel);
         let (tx, rx) = mpsc::unbounded();
-        handle.spawn(client.Raft(box rx.map_err(|_| GrpcError::Other("canceled")))
-            .then(|_| future::ok(())));
+        let call = try!(client.raft());
+        handle.spawn(call.sink_map_err(Error::from)
+            .send_all(rx.map_err(|_| Error::Sink))
+            .map(|_| ())
+            .map_err(|e| error!("send raftmessage failed: {:?}", e)));
         Ok(Conn {
             _client: client,
             stream: tx,
@@ -368,23 +395,30 @@ impl Conn {
 
 // SendRunner is used for sending raft messages to other stores.
 pub struct SendRunner {
+    env: Arc<Environment>,
     conns: HashMap<SocketAddr, Conn>,
 }
 
 impl SendRunner {
-    pub fn new() -> SendRunner {
-        SendRunner { conns: HashMap::default() }
+    pub fn new(env: Arc<Environment>) -> SendRunner {
+        SendRunner {
+            env: env,
+            conns: HashMap::default(),
+        }
     }
 
     fn get_conn(&mut self, addr: SocketAddr, handle: &CoreHandle) -> Result<&Conn> {
         // TDOO: handle Conn::new() error.
-        let conn = self.conns.entry(addr).or_insert_with(|| Conn::new(addr, handle).unwrap());
+        let env = self.env.clone();
+        let conn = self.conns
+            .entry(addr)
+            .or_insert_with(|| Conn::new(env.clone(), addr, handle).unwrap());
         Ok(conn)
     }
 
     fn send(&mut self, t: SendTask, handle: &CoreHandle) -> Result<()> {
         let conn = try!(self.get_conn(t.addr, handle));
-        box_try!(conn.stream.send(t.msg));
+        box_try!(mpsc::UnboundedSender::send(&conn.stream, t.msg));
         Ok(())
     }
 }

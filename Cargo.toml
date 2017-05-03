@@ -71,6 +71,7 @@ git = "https://github.com/pingcap/rust-rocksdb.git"
 
 [dependencies.kvproto]
 git = "https://github.com/pingcap/kvproto.git"
+branch = "disksing/grpc"
 
 [dependencies.tipb]
 git = "https://github.com/pingcap/tipb.git"
@@ -81,7 +82,8 @@ default-features = false
 features = ["nightly", "push"]
 
 [dependencies.grpc]
-git = "https://github.com/stepancheg/grpc-rust.git"
+git = "https://github.com/pingcap/grpc-rs.git"
+branch = "busyjay/dev"
 
 [profile.dev]
 opt-level = 0  # Controls the --opt-level the compiler builds with

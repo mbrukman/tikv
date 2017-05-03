@@ -34,6 +34,7 @@ extern crate signal;
 extern crate nix;
 extern crate prometheus;
 extern crate sys_info;
+extern crate tokio_core;
 
 mod signal_handler;
 
@@ -51,6 +52,7 @@ use rocksdb::{DB, Options as RocksdbOptions, BlockBasedOptions};
 use mio::EventLoop;
 use fs2::FileExt;
 use sys_info::{cpu_num, mem_info};
+use tokio_core::reactor::Core;
 
 use tikv::storage::{Storage, TEMP_DIR, CF_DEFAULT, CF_LOCK, CF_WRITE, CF_RAFT};
 use tikv::util::{self, panic_hook, rocksdb as rocksdb_util, HashMap};
@@ -792,6 +794,7 @@ fn run_raft_server(pd_client: RpcClient,
                    total_mem: u64) {
     let mut event_loop = create_event_loop(&cfg)
         .unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
+    let core = Core::new().unwrap();
     let ch = SendCh::new(event_loop.channel(), "raft-server");
     let pd_client = Arc::new(pd_client);
     let resolver = PdStoreAddrResolver::new(pd_client.clone())
@@ -822,6 +825,7 @@ fn run_raft_server(pd_client: RpcClient,
         snapshot_status_sender: node.get_snapshot_status_sender(),
     };
     let svr = Server::new(&mut event_loop,
+                          &mut core,
                           &cfg,
                           store,
                           server_chan,

@@ -18,15 +18,17 @@ use std::net::SocketAddr;
 use std::collections::hash_map::Entry;
 use std::boxed::FnBox;
 use std::time::Instant;
-use std::iter;
 use std::result;
+use std::sync::Arc;
 
 use threadpool::ThreadPool;
 use mio::Token;
-use grpc::error::GrpcError;
+use futures::{Sink, stream, Future};
+use grpc::Error as GrpcError;
+use grpc::{Environment, ChannelBuilder};
 use kvproto::raft_serverpb::SnapshotChunk;
 use kvproto::raft_serverpb::RaftMessage;
-use kvproto::tikvpb_grpc::{TiKVClient, TiKV};
+use kvproto::tikvpb_grpc::TikvClient;
 
 use raftstore::store::{SnapManager, SnapKey, SnapEntry, Snapshot};
 use util::worker::Runnable;
@@ -35,7 +37,7 @@ use util::HashMap;
 use util::transport::SendCh;
 
 use super::metrics::*;
-use super::{Result, ConnData, Msg};
+use super::{Result, Error, ConnData, Msg};
 use super::transport::RaftStoreRouter;
 
 pub type Callback = Box<FnBox(Result<()>) + Send>;
@@ -138,29 +140,34 @@ fn send_snap(mgr: SnapManager, addr: SocketAddr, data: ConnData) -> Result<()> {
     // Ideally, we should not collect all chunks here, and send an iterator to Grpc clint to save
     // memory. But inside grpc client, the iterator need to be move to another thread, and we can't
     // send the snapshot away because we need to use it later.
-    let chunks: Vec<result::Result<SnapshotChunk, GrpcError>> = {
+    let chunks: Vec<result::Result<_, GrpcError>> = {
+        let mut chunks = vec![];
+        let mut first = SnapshotChunk::new();
+        first.set_message(data.msg);
+        chunks.push(Ok(first));
+
         let snap_chunk = SnapChunk { snap: s.as_mut() };
-        let first = iter::once({
+        for item in snap_chunk {
             let mut chunk = SnapshotChunk::new();
-            chunk.set_message(data.msg);
-            Ok(chunk)
-        });
-        let rests = snap_chunk.map(|item| {
-            item.map(|buf| {
-                    let mut chunk = SnapshotChunk::new();
-                    chunk.set_data(buf);
-                    chunk
-                })
-                .map_err(|e| GrpcError::Io(e))
-        });
-        first.chain(rests).collect()
+            chunk.set_data(try!(item));
+            chunks.push(Ok(chunk));
+        }
+
+        chunks
     };
 
-    let host = format!("{}", addr.ip());
-    let res = TiKVClient::new(&*host, addr.port(), false, Default::default())
-        .and_then(|client| client.Snapshot(box chunks.into_iter()))
-        .map(|_| ())
-        .map_err(From::from);
+    let env = Arc::new(Environment::new(1));
+    let channel = ChannelBuilder::new(env).connect(&format!("{}", addr));
+    let client = TikvClient::new(channel);
+    let call = try!(client.snapshot());
+    let send = call.send_all(stream::iter(chunks.into_iter()));
+    let res = send.and_then(|(call, _)| call.into_receiver())
+        .and_then(|_| {
+            info!("send snapshot done.");
+            Ok(())
+        })
+        .wait()
+        .map_err(Error::from);
 
     info!("[region {}] sent snapshot {} [size: {}, dur: {:?}]",
           key.region_id,

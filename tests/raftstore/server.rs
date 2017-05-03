@@ -21,6 +21,8 @@ use std::boxed::FnBox;
 
 use rocksdb::DB;
 use tempdir::TempDir;
+use tokio_core::reactor::Core;
+
 
 use super::cluster::{Simulator, Cluster};
 use tikv::server::{ServerChannel, Server, ServerTransport, create_event_loop, Msg};
@@ -129,6 +131,7 @@ impl Simulator for ServerCluster {
 
         // TODO: simplify creating raft server later.
         let mut event_loop = create_event_loop(&cfg).unwrap();
+        let mut core = Core::new().unwrap();
         let sendch = SendCh::new(event_loop.channel(), "cluster-simulator");
         let resolver = PdStoreAddrResolver::new(self.pd_client.clone()).unwrap();
         let trans = ServerTransport::new(sendch.clone());
@@ -166,6 +169,7 @@ impl Simulator for ServerCluster {
             snapshot_status_sender: node.get_snapshot_status_sender(),
         };
         let mut server = Server::new(&mut event_loop,
+                                     &mut core,
                                      &cfg,
                                      store,
                                      server_chan,

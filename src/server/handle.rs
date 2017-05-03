@@ -14,13 +14,13 @@
 use std::boxed::FnBox;
 use std::fmt::Debug;
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use grpc::futures_grpc::{GrpcStreamSend, GrpcFutureSend};
-use grpc::error::GrpcError;
 use mio::Token;
+use grpc::{RpcContext, UnaryResponseSink, ClientStreamingResponseSink, RequestStream};
 use futures::{future, Future, Stream};
 use futures::sync::oneshot;
+use tokio_core::reactor::Remote;
 use protobuf::RepeatedField;
 use kvproto::tikvpb_grpc;
 use kvproto::raft_serverpb::*;
@@ -28,439 +28,519 @@ use kvproto::kvrpcpb::*;
 use kvproto::coprocessor::*;
 use kvproto::errorpb::{Error as RegionError, ServerIsBusy};
 
-use util::worker::{Worker, Scheduler};
+use util::worker::Scheduler;
 use util::buf::PipeBuffer;
 use storage::{self, Storage, Key, Options, Mutation};
 use super::transport::RaftStoreRouter;
-use super::coprocessor::{RequestTask, EndPointTask, EndPointHost};
+use super::coprocessor::{RequestTask, EndPointTask};
 use super::snap::Task as SnapTask;
 use super::metrics::*;
-use super::Result;
+use super::Error;
 
-const DEFAULT_COPROCESSOR_BATCH: usize = 50;
-
+#[derive(Clone)]
 pub struct Handle<T: RaftStoreRouter + 'static> {
+    core: Remote,
     // For handling KV requests.
-    storage: Mutex<Storage>,
+    storage: Storage,
     // For handling coprocessor requests.
-    end_point_worker: Mutex<Worker<EndPointTask>>,
-    end_point_concurrency: usize,
+    end_point_scheduler: Scheduler<EndPointTask>,
     // For handling raft messages.
-    ch: Mutex<T>,
-    snap_scheduler: Mutex<Scheduler<SnapTask>>,
-    token: AtomicUsize, // TODO: remove it.
+    ch: T,
+    // For handling snapshot.
+    snap_scheduler: Scheduler<SnapTask>,
+    token: Arc<AtomicUsize>, // TODO: remove it.
 }
 
 impl<T: RaftStoreRouter + 'static> Handle<T> {
-    pub fn new(storage: Storage,
-               end_point_concurrency: usize,
+    pub fn new(core: Remote,
+               storage: Storage,
+               end_point_scheduler: Scheduler<EndPointTask>,
                ch: T,
                snap_scheduler: Scheduler<SnapTask>)
                -> Handle<T> {
         Handle {
-            storage: Mutex::new(storage),
-
-            end_point_worker: Mutex::new(Worker::new("end-point-worker")),
-            end_point_concurrency: end_point_concurrency,
-
-            ch: Mutex::new(ch),
-            snap_scheduler: Mutex::new(snap_scheduler),
-            token: AtomicUsize::new(1),
+            core: core,
+            storage: storage,
+            end_point_scheduler: end_point_scheduler,
+            ch: ch,
+            snap_scheduler: snap_scheduler,
+            token: Arc::new(AtomicUsize::new(1)),
         }
-    }
-
-    pub fn run(&mut self) -> Result<()> {
-        let end_point = EndPointHost::new(self.storage.lock().unwrap().get_engine(),
-                                          self.end_point_worker.lock().unwrap().scheduler(),
-                                          self.end_point_concurrency);
-        try!(self.end_point_worker
-            .lock()
-            .unwrap()
-            .start_batch(end_point, DEFAULT_COPROCESSOR_BATCH));
-        Ok(())
     }
 }
 
-fn make_callback<T: Debug + Send + 'static>() -> (Box<FnBox(T) + Send>, GrpcFutureSend<T>) {
+fn make_callback<T: Debug + Send + 'static>() -> (Box<FnBox(T) + Send>, oneshot::Receiver<T>) {
     let (tx, rx) = oneshot::channel();
     let callback = move |resp| {
         tx.send(resp).unwrap();
     };
-    let future = rx.map_err(GrpcError::Canceled);
-    (box callback, box future)
+    (box callback, rx)
 }
 
-impl<T: RaftStoreRouter + 'static> tikvpb_grpc::TiKVAsync for Handle<T> {
-    fn KvGet(&self, mut p: GetRequest) -> GrpcFutureSend<GetResponse> {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
-        let (cb, future) = make_callback();
-        self.storage
-            .lock()
-            .unwrap()
-            .async_get(p.take_context(),
-                       Key::from_raw(p.get_key()),
-                       p.get_version(),
-                       cb)
-            .unwrap();
-        future.map(|v| {
-                let mut resp = GetResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else {
-                    match v {
-                        Ok(Some(val)) => resp.set_value(val),
-                        Ok(None) => resp.set_value(vec![]),
-                        Err(e) => resp.set_error(extract_key_error(&e)),
-                    }
-                }
-                resp
-            })
-            .boxed()
-    }
-
-    fn KvScan(&self, mut p: ScanRequest) -> GrpcFutureSend<ScanResponse> {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
-        let mut options = Options::default();
-        options.key_only = p.get_key_only();
-
-        let (cb, future) = make_callback();
-        self.storage
-            .lock()
-            .unwrap()
-            .async_scan(p.take_context(),
-                        Key::from_raw(p.get_start_key()),
-                        p.get_limit() as usize,
-                        p.get_version(),
-                        options,
-                        cb)
-            .unwrap();
-        future.map(|v| {
-                let mut resp = ScanResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else {
-                    resp.set_pairs(RepeatedField::from_vec(extract_kv_pairs(v)));
-                }
-                resp
-            })
-            .boxed()
-    }
-
-    fn KvPrewrite(&self, mut p: PrewriteRequest) -> GrpcFutureSend<PrewriteResponse> {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
-        let mutations = p.take_mutations()
-            .into_iter()
-            .map(|mut x| {
-                match x.get_op() {
-                    Op::Put => Mutation::Put((Key::from_raw(x.get_key()), x.take_value())),
-                    Op::Del => Mutation::Delete(Key::from_raw(x.get_key())),
-                    Op::Lock => Mutation::Lock(Key::from_raw(x.get_key())),
-                }
-            })
-            .collect();
-        let mut options = Options::default();
-        options.lock_ttl = p.get_lock_ttl();
-        options.skip_constraint_check = p.get_skip_constraint_check();
-
-        let (cb, future) = make_callback();
-        self.storage
-            .lock()
-            .unwrap()
-            .async_prewrite(p.take_context(),
-                            mutations,
-                            p.take_primary_lock(),
-                            p.get_start_version(),
-                            options,
-                            cb)
-            .unwrap();
-        future.map(|v| {
-                let mut resp = PrewriteResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else {
-                    resp.set_errors(RepeatedField::from_vec(extract_key_errors(v)));
-                }
-                resp
-            })
-            .boxed()
-    }
-
-    fn KvCommit(&self, mut p: CommitRequest) -> GrpcFutureSend<CommitResponse> {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
-        let keys = p.get_keys().iter().map(|x| Key::from_raw(x)).collect();
-
-        let (cb, future) = make_callback();
-        self.storage
-            .lock()
-            .unwrap()
-            .async_commit(p.take_context(),
-                          keys,
-                          p.get_start_version(),
-                          p.get_commit_version(),
-                          cb)
-            .unwrap();
-        future.map(|v| {
-                let mut resp = CommitResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    resp.set_error(extract_key_error(&e));
-                }
-                resp
-            })
-            .boxed()
-    }
-
-    fn KvCleanup(&self, mut p: CleanupRequest) -> GrpcFutureSend<CleanupResponse> {
+impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
+    fn kv_get(&self, _: RpcContext, mut req: GetRequest, sink: UnaryResponseSink<GetResponse>) {
         RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
 
-        let (cb, future) = make_callback();
-        self.storage
-            .lock()
-            .unwrap()
-            .async_cleanup(p.take_context(),
-                           Key::from_raw(p.get_key()),
-                           p.get_start_version(),
+        let storage = self.storage.clone();
+        self.core.spawn(move |_| {
+            let (cb, future) = make_callback();
+            storage.async_get(req.take_context(),
+                           Key::from_raw(req.get_key()),
+                           req.get_version(),
                            cb)
-            .unwrap();
-        future.map(|v| {
-                let mut resp = CleanupResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    if let Some(ts) = extract_committed(&e) {
-                        resp.set_commit_version(ts);
+                .unwrap();
+            future.map_err(Error::from)
+                .map(|v| {
+                    let mut res = GetResponse::new();
+                    if let Some(err) = extract_region_error(&v) {
+                        res.set_region_error(err);
                     } else {
+                        match v {
+                            Ok(Some(val)) => res.set_value(val),
+                            Ok(None) => res.set_value(vec![]),
+                            Err(e) => res.set_error(extract_key_error(&e)),
+                        }
+                    }
+                    res
+                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
+                .map(|_| ())
+                .map_err(|e| error!("kv_get failed: {:?}", e))
+        });
+    }
+
+    fn kv_scan(&self, _: RpcContext, mut req: ScanRequest, sink: UnaryResponseSink<ScanResponse>) {
+        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+
+        let storage = self.storage.clone();
+        self.core
+            .spawn(move |_| {
+                let mut options = Options::default();
+                options.key_only = req.get_key_only();
+
+                let (cb, future) = make_callback();
+                storage.async_scan(req.take_context(),
+                                Key::from_raw(req.get_start_key()),
+                                req.get_limit() as usize,
+                                req.get_version(),
+                                options,
+                                cb)
+                    .unwrap();
+                future.map_err(Error::from)
+                    .map(|v| {
+                        let mut resp = ScanResponse::new();
+                        if let Some(err) = extract_region_error(&v) {
+                            resp.set_region_error(err);
+                        } else {
+                            resp.set_pairs(RepeatedField::from_vec(extract_kv_pairs(v)));
+                        }
+                        resp
+                    })
+                    .and_then(|res| sink.success(res).map_err(Error::from))
+                    .map(|_| ())
+                    .map_err(|e| error!("kv_scan failed: {:?}", e))
+            })
+    }
+
+    fn kv_prewrite(&self,
+                   _: RpcContext,
+                   mut req: PrewriteRequest,
+                   sink: UnaryResponseSink<PrewriteResponse>) {
+        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+
+        let storage = self.storage.clone();
+        self.core.spawn(move |_| {
+            let mutations = req.take_mutations()
+                .into_iter()
+                .map(|mut x| {
+                    match x.get_op() {
+                        Op::Put => Mutation::Put((Key::from_raw(x.get_key()), x.take_value())),
+                        Op::Del => Mutation::Delete(Key::from_raw(x.get_key())),
+                        Op::Lock => Mutation::Lock(Key::from_raw(x.get_key())),
+                    }
+                })
+                .collect();
+            let mut options = Options::default();
+            options.lock_ttl = req.get_lock_ttl();
+            options.skip_constraint_check = req.get_skip_constraint_check();
+
+            let (cb, future) = make_callback();
+            storage.async_prewrite(req.take_context(),
+                                mutations,
+                                req.take_primary_lock(),
+                                req.get_start_version(),
+                                options,
+                                cb)
+                .unwrap();
+            future.map_err(Error::from)
+                .map(|v| {
+                    let mut resp = PrewriteResponse::new();
+                    if let Some(err) = extract_region_error(&v) {
+                        resp.set_region_error(err);
+                    } else {
+                        resp.set_errors(RepeatedField::from_vec(extract_key_errors(v)));
+                    }
+                    resp
+                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
+                .map(|_| ())
+                .map_err(|e| error!("kv_prewrite failed: {:?}", e))
+        });
+    }
+
+    fn kv_commit(&self,
+                 _: RpcContext,
+                 mut req: CommitRequest,
+                 sink: UnaryResponseSink<CommitResponse>) {
+        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+
+        let storage = self.storage.clone();
+        self.core.spawn(move |_| {
+            let keys = req.get_keys().iter().map(|x| Key::from_raw(x)).collect();
+
+            let (cb, future) = make_callback();
+            storage.async_commit(req.take_context(),
+                              keys,
+                              req.get_start_version(),
+                              req.get_commit_version(),
+                              cb)
+                .unwrap();
+            future.map_err(Error::from)
+                .map(|v| {
+                    let mut resp = CommitResponse::new();
+                    if let Some(err) = extract_region_error(&v) {
+                        resp.set_region_error(err);
+                    } else if let Err(e) = v {
                         resp.set_error(extract_key_error(&e));
                     }
-                }
-                resp
-            })
-            .boxed()
+                    resp
+                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
+                .map(|_| ())
+                .map_err(|e| error!("kv_commit failed: {:?}", e))
+        });
     }
 
-    fn KvBatchGet(&self, mut p: BatchGetRequest) -> GrpcFutureSend<BatchGetResponse> {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
-        let keys = p.get_keys().into_iter().map(|x| Key::from_raw(x)).collect();
-
-        let (cb, future) = make_callback();
-        self.storage
-            .lock()
-            .unwrap()
-            .async_batch_get(p.take_context(), keys, p.get_version(), cb)
-            .unwrap();
-        future.map(|v| {
-                let mut resp = BatchGetResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else {
-                    resp.set_pairs(RepeatedField::from_vec(extract_kv_pairs(v)))
-                }
-                resp
-            })
-            .boxed()
-    }
-
-    fn KvBatchRollback(&self,
-                       mut p: BatchRollbackRequest)
-                       -> GrpcFutureSend<BatchRollbackResponse> {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
-        let keys = p.get_keys().into_iter().map(|x| Key::from_raw(x)).collect();
-
-        let (cb, future) = make_callback();
-        self.storage
-            .lock()
-            .unwrap()
-            .async_rollback(p.take_context(), keys, p.get_start_version(), cb)
-            .unwrap();
-        future.map(|v| {
-                let mut resp = BatchRollbackResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    resp.set_error(extract_key_error(&e));
-                }
-                resp
-            })
-            .boxed()
-    }
-
-    fn KvScanLock(&self, mut p: ScanLockRequest) -> GrpcFutureSend<ScanLockResponse> {
+    fn kv_cleanup(&self,
+                  _: RpcContext,
+                  mut req: CleanupRequest,
+                  sink: UnaryResponseSink<CleanupResponse>) {
         RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
 
-        let (cb, future) = make_callback();
-        self.storage
-            .lock()
-            .unwrap()
-            .async_scan_lock(p.take_context(), p.get_max_version(), cb)
-            .unwrap();
-        future.map(|v| {
-                let mut resp = ScanLockResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else {
-                    match v {
-                        Ok(locks) => resp.set_locks(RepeatedField::from_vec(locks)),
-                        Err(e) => resp.set_error(extract_key_error(&e)),
+        let storage = self.storage.clone();
+        self.core.spawn(move |_| {
+            let (cb, future) = make_callback();
+            storage.async_cleanup(req.take_context(),
+                               Key::from_raw(req.get_key()),
+                               req.get_start_version(),
+                               cb)
+                .unwrap();
+            future.map_err(Error::from)
+                .map(|v| {
+                    let mut resp = CleanupResponse::new();
+                    if let Some(err) = extract_region_error(&v) {
+                        resp.set_region_error(err);
+                    } else if let Err(e) = v {
+                        if let Some(ts) = extract_committed(&e) {
+                            resp.set_commit_version(ts);
+                        } else {
+                            resp.set_error(extract_key_error(&e));
+                        }
                     }
-                }
-                resp
-            })
-            .boxed()
+                    resp
+                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
+                .map(|_| ())
+                .map_err(|e| error!("kv_cleanup failed: {:?}", e))
+        });
     }
 
-    fn KvResolveLock(&self, mut p: ResolveLockRequest) -> GrpcFutureSend<ResolveLockResponse> {
+    fn kv_batch_get(&self,
+                    _: RpcContext,
+                    mut req: BatchGetRequest,
+                    sink: UnaryResponseSink<BatchGetResponse>) {
         RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
-        let commit_ts = match p.get_commit_version() {
-            0 => None,
-            x => Some(x),
-        };
+        let storage = self.storage.clone();
+        self.core.spawn(move |_| {
+            let keys = req.get_keys().into_iter().map(|x| Key::from_raw(x)).collect();
 
-        let (cb, future) = make_callback();
-        self.storage
-            .lock()
-            .unwrap()
-            .async_resolve_lock(p.take_context(), p.get_start_version(), commit_ts, cb)
-            .unwrap();
-        future.map(|v| {
-                let mut resp = ResolveLockResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    resp.set_error(extract_key_error(&e));
-                }
-                resp
-            })
-            .boxed()
-    }
-
-    fn KvGC(&self, mut p: GCRequest) -> GrpcFutureSend<GCResponse> {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
-
-        let (cb, future) = make_callback();
-        self.storage.lock().unwrap().async_gc(p.take_context(), p.get_safe_point(), cb).unwrap();
-        future.map(|v| {
-                let mut resp = GCResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    resp.set_error(extract_key_error(&e));
-                }
-                resp
-            })
-            .boxed()
-    }
-
-    fn RawGet(&self, mut p: RawGetRequest) -> GrpcFutureSend<RawGetResponse> {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
-
-        let (cb, future) = make_callback();
-        self.storage.lock().unwrap().async_raw_get(p.take_context(), p.take_key(), cb).unwrap();
-        future.map(|v| {
-                let mut resp = RawGetResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else {
-                    match v {
-                        Ok(Some(val)) => resp.set_value(val),
-                        Ok(None) => {}
-                        Err(e) => resp.set_error(format!("{}", e)),
+            let (cb, future) = make_callback();
+            storage.async_batch_get(req.take_context(), keys, req.get_version(), cb)
+                .unwrap();
+            future.map_err(Error::from)
+                .map(|v| {
+                    let mut resp = BatchGetResponse::new();
+                    if let Some(err) = extract_region_error(&v) {
+                        resp.set_region_error(err);
+                    } else {
+                        resp.set_pairs(RepeatedField::from_vec(extract_kv_pairs(v)))
                     }
-                }
-                resp
-            })
-            .boxed()
+                    resp
+                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
+                .map(|_| ())
+                .map_err(|e| error!("kv_batch_get failed: {:?}", e))
+        });
     }
 
-    fn RawPut(&self, mut p: RawPutRequest) -> GrpcFutureSend<RawPutResponse> {
+    fn kv_batch_rollback(&self,
+                         _: RpcContext,
+                         mut req: BatchRollbackRequest,
+                         sink: UnaryResponseSink<BatchRollbackResponse>) {
         RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
 
-        let (cb, future) = make_callback();
-        self.storage
-            .lock()
-            .unwrap()
-            .async_raw_put(p.take_context(), p.take_key(), p.take_value(), cb)
-            .unwrap();
-        future.map(|v| {
-                let mut resp = RawPutResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    resp.set_error(format!("{}", e));
-                }
-                resp
-            })
-            .boxed()
+        let storage = self.storage.clone();
+        self.core.spawn(move |_| {
+            let keys = req.get_keys().into_iter().map(|x| Key::from_raw(x)).collect();
+
+            let (cb, future) = make_callback();
+            storage.async_rollback(req.take_context(), keys, req.get_start_version(), cb)
+                .unwrap();
+            future.map_err(Error::from)
+                .map(|v| {
+                    let mut resp = BatchRollbackResponse::new();
+                    if let Some(err) = extract_region_error(&v) {
+                        resp.set_region_error(err);
+                    } else if let Err(e) = v {
+                        resp.set_error(extract_key_error(&e));
+                    }
+                    resp
+                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
+                .map(|_| ())
+                .map_err(|e| error!("kv_batch_rollback failed: {:?}", e))
+        });
     }
 
-    fn RawDelete(&self, mut p: RawDeleteRequest) -> GrpcFutureSend<RawDeleteResponse> {
+    fn kv_scan_lock(&self,
+                    _: RpcContext,
+                    mut req: ScanLockRequest,
+                    sink: UnaryResponseSink<ScanLockResponse>) {
         RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
 
-        let (cb, future) = make_callback();
-        self.storage.lock().unwrap().async_raw_delete(p.take_context(), p.take_key(), cb).unwrap();
-        future.map(|v| {
-                let mut resp = RawDeleteResponse::new();
-                if let Some(err) = extract_region_error(&v) {
-                    resp.set_region_error(err);
-                } else if let Err(e) = v {
-                    resp.set_error(format!("{}", e));
-                }
-                resp
-            })
-            .boxed()
+        let storage = self.storage.clone();
+        self.core.spawn(move |_| {
+            let (cb, future) = make_callback();
+            storage.async_scan_lock(req.take_context(), req.get_max_version(), cb)
+                .unwrap();
+            future.map_err(Error::from)
+                .map(|v| {
+                    let mut resp = ScanLockResponse::new();
+                    if let Some(err) = extract_region_error(&v) {
+                        resp.set_region_error(err);
+                    } else {
+                        match v {
+                            Ok(locks) => resp.set_locks(RepeatedField::from_vec(locks)),
+                            Err(e) => resp.set_error(extract_key_error(&e)),
+                        }
+                    }
+                    resp
+                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
+                .map(|_| ())
+                .map_err(|e| error!("kv_scan_lock failed: {:?}", e))
+        });
     }
 
-    fn Coprocessor(&self, p: Request) -> GrpcFutureSend<Response> {
+    fn kv_resolve_lock(&self,
+                       _: RpcContext,
+                       mut req: ResolveLockRequest,
+                       sink: UnaryResponseSink<ResolveLockResponse>) {
+        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+
+        let storage = self.storage.clone();
+        self.core.spawn(move |_| {
+            let commit_ts = match req.get_commit_version() {
+                0 => None,
+                x => Some(x),
+            };
+
+            let (cb, future) = make_callback();
+            storage.async_resolve_lock(req.take_context(), req.get_start_version(), commit_ts, cb)
+                .unwrap();
+            future.map_err(Error::from)
+                .map(|v| {
+                    let mut resp = ResolveLockResponse::new();
+                    if let Some(err) = extract_region_error(&v) {
+                        resp.set_region_error(err);
+                    } else if let Err(e) = v {
+                        resp.set_error(extract_key_error(&e));
+                    }
+                    resp
+                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
+                .map(|_| ())
+                .map_err(|e| error!("kv_resolve_lock failed: {:?}", e))
+        });
+    }
+
+    fn kv_gc(&self, _: RpcContext, mut req: GCRequest, sink: UnaryResponseSink<GCResponse>) {
+        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+
+        let storage = self.storage.clone();
+        self.core.spawn(move |_| {
+            let (cb, future) = make_callback();
+            storage.async_gc(req.take_context(), req.get_safe_point(), cb).unwrap();
+            future.map_err(Error::from)
+                .map(|v| {
+                    let mut resp = GCResponse::new();
+                    if let Some(err) = extract_region_error(&v) {
+                        resp.set_region_error(err);
+                    } else if let Err(e) = v {
+                        resp.set_error(extract_key_error(&e));
+                    }
+                    resp
+                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
+                .map(|_| ())
+                .map_err(|e| error!("kv_gc failed: {:?}", e))
+        });
+    }
+
+    fn raw_get(&self,
+               _: RpcContext,
+               mut req: RawGetRequest,
+               sink: UnaryResponseSink<RawGetResponse>) {
+        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+
+        let storage = self.storage.clone();
+        self.core.spawn(move |_| {
+            let (cb, future) = make_callback();
+            storage.async_raw_get(req.take_context(), req.take_key(), cb).unwrap();
+            future.map_err(Error::from)
+                .map(|v| {
+                    let mut resp = RawGetResponse::new();
+                    if let Some(err) = extract_region_error(&v) {
+                        resp.set_region_error(err);
+                    } else {
+                        match v {
+                            Ok(Some(val)) => resp.set_value(val),
+                            Ok(None) => {}
+                            Err(e) => resp.set_error(format!("{}", e)),
+                        }
+                    }
+                    resp
+                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
+                .map(|_| ())
+                .map_err(|e| error!("raw_get failed: {:?}", e))
+        });
+    }
+
+    fn raw_put(&self,
+               _: RpcContext,
+               mut req: RawPutRequest,
+               sink: UnaryResponseSink<RawPutResponse>) {
+        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+
+        let storage = self.storage.clone();
+        self.core.spawn(move |_| {
+            let (cb, future) = make_callback();
+            storage.async_raw_put(req.take_context(), req.take_key(), req.take_value(), cb)
+                .unwrap();
+            future.map_err(Error::from)
+                .map(|v| {
+                    let mut resp = RawPutResponse::new();
+                    if let Some(err) = extract_region_error(&v) {
+                        resp.set_region_error(err);
+                    } else if let Err(e) = v {
+                        resp.set_error(format!("{}", e));
+                    }
+                    resp
+                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
+                .map(|_| ())
+                .map_err(|e| error!("raw_put failed: {:?}", e))
+        });
+    }
+
+    fn raw_delete(&self,
+                  _: RpcContext,
+                  mut req: RawDeleteRequest,
+                  sink: UnaryResponseSink<RawDeleteResponse>) {
+        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+
+        let storage = self.storage.clone();
+        self.core.spawn(move |_| {
+            let (cb, future) = make_callback();
+            storage.async_raw_delete(req.take_context(), req.take_key(), cb).unwrap();
+            future.map_err(Error::from)
+                .map(|v| {
+                    let mut resp = RawDeleteResponse::new();
+                    if let Some(err) = extract_region_error(&v) {
+                        resp.set_region_error(err);
+                    } else if let Err(e) = v {
+                        resp.set_error(format!("{}", e));
+                    }
+                    resp
+                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
+                .map(|_| ())
+                .map_err(|e| error!("raw_delete failed: {:?}", e))
+        });
+    }
+
+    fn coprocessor(&self, _: RpcContext, req: Request, sink: UnaryResponseSink<Response>) {
         RECV_MSG_COUNTER.with_label_values(&["coprocessor"]).inc();
 
-        let (cb, future) = make_callback();
-        self.end_point_worker
-            .lock()
-            .unwrap()
-            .schedule(EndPointTask::Request(RequestTask::new(p, cb)))
-            .unwrap();
-        future.boxed()
+        let end_point_scheduler = self.end_point_scheduler.clone();
+        self.core.spawn(move |_| {
+            let (cb, future) = make_callback();
+            end_point_scheduler.schedule(EndPointTask::Request(RequestTask::new(req, cb))).unwrap();
+            future.map_err(Error::from)
+                .and_then(|res| sink.success(res).map_err(Error::from))
+                .map(|_| ())
+                .map_err(|e| error!("coprocessor failed: {:?}", e))
+        });
     }
 
-    fn Raft(&self, s: GrpcStreamSend<RaftMessage>) -> GrpcFutureSend<Done> {
-        let ch = self.ch.lock().unwrap().clone();
-        s.for_each(move |msg| {
-                ch.send_raft_msg(msg).map_err(|_| GrpcError::Other("send raft msg fail"))
-            })
-            .and_then(|_| future::ok::<_, GrpcError>(Done::new()))
-            .boxed()
+    fn raft(&self,
+            _: RpcContext,
+            stream: RequestStream<RaftMessage>,
+            _: ClientStreamingResponseSink<Done>) {
+        let ch = self.ch.clone();
+        self.core.spawn(move |_| {
+            stream.map_err(Error::from)
+                .for_each(move |msg| future::result(ch.send_raft_msg(msg)).map_err(Error::from))
+                .then(|_| future::ok(()))
+        });
     }
 
-    fn Snapshot(&self, s: GrpcStreamSend<SnapshotChunk>) -> GrpcFutureSend<Done> {
+    fn snapshot(&self,
+                _: RpcContext,
+                stream: RequestStream<SnapshotChunk>,
+                _: ClientStreamingResponseSink<Done>) {
         let token = Token(self.token.fetch_add(1, Ordering::SeqCst));
-        let sched = self.snap_scheduler.lock().unwrap().clone();
+        let sched = self.snap_scheduler.clone();
         let sched2 = sched.clone();
-        s.for_each(move |mut chunk| {
-                if chunk.has_message() {
-                    sched.schedule(SnapTask::Register(token, chunk.take_message()))
-                        .map_err(|_| GrpcError::Other("schedule snap_task fail"))
-                } else if !chunk.get_data().is_empty() {
-                    // TODO: Remove PipeBuffer or take good use of it.
-                    let mut b = PipeBuffer::new(chunk.get_data().len());
-                    b.write_all(chunk.get_data()).unwrap();
-                    sched.schedule(SnapTask::Write(token, b))
-                        .map_err(|_| GrpcError::Other("schedule snap_task fail"))
-                } else {
-                    Err(GrpcError::Other("empty chunk"))
-                }
-            })
-            .then(move |res| {
-                let res = match res {
-                    Ok(_) => sched2.schedule(SnapTask::Close(token)),
-                    Err(e) => {
-                        error!("receive snapshot err: {}", e);
-                        sched2.schedule(SnapTask::Discard(token))
-                    }
-                };
-                future::result(res.map_err(|_| GrpcError::Other("schedule snap_task fail")))
-            })
-            .and_then(|_| future::ok::<_, GrpcError>(Done::new()))
-            .boxed()
+        self.core.spawn(move |_| {
+            stream.map_err(Error::from)
+                .for_each(move |mut chunk| {
+                    let res = if chunk.has_message() {
+                        sched.schedule(SnapTask::Register(token, chunk.take_message()))
+                            .map_err(Error::from)
+                    } else if !chunk.get_data().is_empty() {
+                        // TODO: Remove PipeBuffer or take good use of it.
+                        let mut b = PipeBuffer::new(chunk.get_data().len());
+                        b.write_all(chunk.get_data()).unwrap();
+                        sched.schedule(SnapTask::Write(token, b)).map_err(Error::from)
+                    } else {
+                        Err(box_err!("empty chunk"))
+                    };
+                    future::result(res)
+                })
+                .then(move |res| {
+                    let res = match res {
+                        Ok(_) => sched2.schedule(SnapTask::Close(token)),
+                        Err(e) => {
+                            error!("receive snapshot err: {}", e);
+                            sched2.schedule(SnapTask::Discard(token))
+                        }
+                    };
+                    future::result(res.map_err(Error::from))
+                })
+                .then(|_| future::ok(()))
+        });
     }
 }
 

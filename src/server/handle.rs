@@ -103,7 +103,11 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
                     }
                     res
                 })
-                .and_then(|res| sink.success(res).map_err(Error::from))
+                .and_then(|res| {
+                    let f = try!(sink.success(res));
+                    Ok(f.map_err(Error::from))
+                })
+                .flatten()
                 .map(|_| ())
                 .map_err(|e| error!("kv_get failed: {:?}", e))
         });
@@ -136,7 +140,11 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
                         }
                         resp
                     })
-                    .and_then(|res| sink.success(res).map_err(Error::from))
+                    .and_then(|res| {
+                        let f = try!(sink.success(res));
+                        Ok(f.map_err(Error::from))
+                    })
+                    .flatten()
                     .map(|_| ())
                     .map_err(|e| error!("kv_scan failed: {:?}", e))
             })
@@ -182,7 +190,11 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
                     }
                     resp
                 })
-                .and_then(|res| sink.success(res).map_err(Error::from))
+                .and_then(|res| {
+                    let f = try!(sink.success(res));
+                    Ok(f.map_err(Error::from))
+                })
+                .flatten()
                 .map(|_| ())
                 .map_err(|e| error!("kv_prewrite failed: {:?}", e))
         });
@@ -215,7 +227,11 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
                     }
                     resp
                 })
-                .and_then(|res| sink.success(res).map_err(Error::from))
+                .and_then(|res| {
+                    let f = try!(sink.success(res));
+                    Ok(f.map_err(Error::from))
+                })
+                .flatten()
                 .map(|_| ())
                 .map_err(|e| error!("kv_commit failed: {:?}", e))
         });
@@ -249,7 +265,11 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
                     }
                     resp
                 })
-                .and_then(|res| sink.success(res).map_err(Error::from))
+                .and_then(|res| {
+                    let f = try!(sink.success(res));
+                    Ok(f.map_err(Error::from))
+                })
+                .flatten()
                 .map(|_| ())
                 .map_err(|e| error!("kv_cleanup failed: {:?}", e))
         });
@@ -277,7 +297,11 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
                     }
                     resp
                 })
-                .and_then(|res| sink.success(res).map_err(Error::from))
+                .and_then(|res| {
+                    let f = try!(sink.success(res));
+                    Ok(f.map_err(Error::from))
+                })
+                .flatten()
                 .map(|_| ())
                 .map_err(|e| error!("kv_batch_get failed: {:?}", e))
         });
@@ -306,7 +330,11 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
                     }
                     resp
                 })
-                .and_then(|res| sink.success(res).map_err(Error::from))
+                .and_then(|res| {
+                    let f = try!(sink.success(res));
+                    Ok(f.map_err(Error::from))
+                })
+                .flatten()
                 .map(|_| ())
                 .map_err(|e| error!("kv_batch_rollback failed: {:?}", e))
         });
@@ -336,7 +364,11 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
                     }
                     resp
                 })
-                .and_then(|res| sink.success(res).map_err(Error::from))
+                .and_then(|res| {
+                    let f = try!(sink.success(res));
+                    Ok(f.map_err(Error::from))
+                })
+                .flatten()
                 .map(|_| ())
                 .map_err(|e| error!("kv_scan_lock failed: {:?}", e))
         });
@@ -368,7 +400,11 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
                     }
                     resp
                 })
-                .and_then(|res| sink.success(res).map_err(Error::from))
+                .and_then(|res| {
+                    let f = try!(sink.success(res));
+                    Ok(f.map_err(Error::from))
+                })
+                .flatten()
                 .map(|_| ())
                 .map_err(|e| error!("kv_resolve_lock failed: {:?}", e))
         });
@@ -391,7 +427,11 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
                     }
                     resp
                 })
-                .and_then(|res| sink.success(res).map_err(Error::from))
+                .and_then(|res| {
+                    let f = try!(sink.success(res));
+                    Ok(f.map_err(Error::from))
+                })
+                .flatten()
                 .map(|_| ())
                 .map_err(|e| error!("kv_gc failed: {:?}", e))
         });
@@ -421,7 +461,11 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
                     }
                     resp
                 })
-                .and_then(|res| sink.success(res).map_err(Error::from))
+                .and_then(|res| {
+                    let f = try!(sink.success(res));
+                    Ok(f.map_err(Error::from))
+                })
+                .flatten()
                 .map(|_| ())
                 .map_err(|e| error!("raw_get failed: {:?}", e))
         });
@@ -448,7 +492,11 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
                     }
                     resp
                 })
-                .and_then(|res| sink.success(res).map_err(Error::from))
+                .and_then(|res| {
+                    let f = try!(sink.success(res));
+                    Ok(f.map_err(Error::from))
+                })
+                .flatten()
                 .map(|_| ())
                 .map_err(|e| error!("raw_put failed: {:?}", e))
         });
@@ -474,7 +522,11 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
                     }
                     resp
                 })
-                .and_then(|res| sink.success(res).map_err(Error::from))
+                .and_then(|res| {
+                    let f = try!(sink.success(res));
+                    Ok(f.map_err(Error::from))
+                })
+                .flatten()
                 .map(|_| ())
                 .map_err(|e| error!("raw_delete failed: {:?}", e))
         });
@@ -488,7 +540,11 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
             let (cb, future) = make_callback();
             end_point_scheduler.schedule(EndPointTask::Request(RequestTask::new(req, cb))).unwrap();
             future.map_err(Error::from)
-                .and_then(|res| sink.success(res).map_err(Error::from))
+                .and_then(|res| {
+                    let f = try!(sink.success(res));
+                    Ok(f.map_err(Error::from))
+                })
+                .flatten()
                 .map(|_| ())
                 .map_err(|e| error!("coprocessor failed: {:?}", e))
         });

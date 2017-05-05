@@ -805,8 +805,8 @@ fn start_server<T, S>(mut server: Server<T, S>,
             tx.send(()).unwrap();
         })
         .unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
-    signal_handler::handle_signal(ch, engine, backup_path);
     core.run(rx).unwrap();
+    signal_handler::handle_signal(ch, engine, backup_path);
     h.join().unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
 }
 

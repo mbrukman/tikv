@@ -565,7 +565,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
     fn snapshot(&self,
                 _: RpcContext,
                 stream: RequestStream<SnapshotChunk>,
-                _: ClientStreamingResponseSink<Done>) {
+                sink: ClientStreamingResponseSink<Done>) {
         let token = Token(self.token.fetch_add(1, Ordering::SeqCst));
         let sched = self.snap_scheduler.clone();
         let sched2 = sched.clone();
@@ -595,6 +595,11 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
                     };
                     future::result(res.map_err(Error::from))
                 })
+                .and_then(|_| {
+                    let f = try!(sink.success(Done::new()));
+                    Ok(f.map_err(Error::from))
+                })
+                .flatten()
                 .then(|_| future::ok(()))
         });
     }

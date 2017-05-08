@@ -253,7 +253,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 [[package]]
 name = "grpc"
 version = "0.1.0"
-source = "git+https://github.com/pingcap/grpc-rs.git?branch=busyjay/dev#dbc476faa9b7a433100a6efc267d805b3f5f9de8"
+source = "git+https://github.com/pingcap/grpc-rs.git?branch=busyjay/dev#3ccd54240e8c837d7a9a9e4d5615f76d8767ca5e"
 dependencies = [
  "futures 0.1.13 (registry+https://github.com/rust-lang/crates.io-index)",
  "grpc-sys 0.1.0 (git+https://github.com/pingcap/grpc-rs.git?branch=busyjay/dev)",
@@ -264,7 +264,7 @@ dependencies = [
 [[package]]
 name = "grpc-sys"
 version = "0.1.0"
-source = "git+https://github.com/pingcap/grpc-rs.git?branch=busyjay/dev#dbc476faa9b7a433100a6efc267d805b3f5f9de8"
+source = "git+https://github.com/pingcap/grpc-rs.git?branch=busyjay/dev#3ccd54240e8c837d7a9a9e4d5615f76d8767ca5e"
 dependencies = [
  "gcc 0.3.35 (registry+https://github.com/rust-lang/crates.io-index)",
  "libc 0.2.21 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -364,7 +364,7 @@ dependencies = [
 [[package]]
 name = "kvproto"
 version = "0.0.1"
-source = "git+https://github.com/pingcap/kvproto.git?branch=disksing/grpc#e8412204037b675bf6b517c41b47ea6222b01124"
+source = "git+https://github.com/pingcap/kvproto.git?branch=disksing/grpc#7ad8ee783e1a2f0a2ded4dd1043c7130eeec1b18"
 dependencies = [
  "futures 0.1.13 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures-cpupool 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",

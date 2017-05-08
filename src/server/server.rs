@@ -106,11 +106,10 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
                             ch.raft_router.clone(),
                             snap_worker.scheduler());
         let env = Arc::new(Environment::new(1));
-        let s = create_tikv_service(h);
         let addr = try!(SocketAddr::from_str(&cfg.addr));
         let ip = format!("{}", addr.ip());
         let mut grpc_server = ServerBuilder::new(env.clone())
-            .register_service(s)
+            .register_service(create_tikv(h))
             .bind(ip, addr.port() as u32)
             .build();
         grpc_server.start();
@@ -380,8 +379,7 @@ impl Conn {
         let channel = ChannelBuilder::new(env).connect(&format!("{}", addr));
         let client = TikvClient::new(channel);
         let (tx, rx) = mpsc::unbounded();
-        let call = try!(client.raft());
-        handle.spawn(call.sink_map_err(Error::from)
+        handle.spawn(client.raft().sink_map_err(Error::from)
             .send_all(rx.map_err(|_| Error::Sink))
             .map(|_| ())
             .map_err(|e| error!("send raftmessage failed: {:?}", e)));

@@ -158,8 +158,7 @@ fn send_snap(mgr: SnapManager, addr: SocketAddr, data: ConnData) -> Result<()> {
     let env = Arc::new(Environment::new(1));
     let channel = ChannelBuilder::new(env).connect(&format!("{}", addr));
     let client = TikvClient::new(channel);
-    let call = try!(client.snapshot());
-    let send = call.send_all(stream::iter(chunks.into_iter()));
+    let send = client.snapshot().send_all(stream::iter(chunks.into_iter()));
     let res = send.and_then(|(call, _)| call.into_receiver())
         .and_then(|_| {
             info!("send snapshot done.");

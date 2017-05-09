@@ -86,9 +86,13 @@ quick_error!{
         SnapWorkerStopped(err: Stopped<SnapTask>) {
             from()
         }
-        Sink {description("failed to poll from mpsc receiver")}
+        Sink {
+            description("failed to poll from mpsc receiver")
+        }
         Canceled(err: Canceled) {
             from()
+            cause(err)
+            description(err.description())
         }
     }
 }

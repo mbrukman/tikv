@@ -79,7 +79,7 @@ fn make_callback<T: Debug + Send + 'static>() -> (Box<FnBox(T) + Send>, oneshot:
 
 impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
     fn kv_get(&self, _: RpcContext, mut req: GetRequest, sink: UnarySink<GetResponse>) {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+        let timer = GRPC_MSG_HISTOGRAM_VEC.with_label_values(&["kv_get"]).start_timer();
 
         let storage = self.storage.clone();
         self.core.spawn(move |_| {
@@ -104,13 +104,13 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     res
                 })
                 .and_then(|res| sink.success(res).map_err(Error::from))
-                .map(|_| ())
+                .map(|_| timer.observe_duration())
                 .map_err(|e| error!("kv_get failed: {:?}", e))
         });
     }
 
     fn kv_scan(&self, _: RpcContext, mut req: ScanRequest, sink: UnarySink<ScanResponse>) {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+        let timer = GRPC_MSG_HISTOGRAM_VEC.with_label_values(&["kv_scan"]).start_timer();
 
         let storage = self.storage.clone();
         self.core
@@ -137,7 +137,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                         resp
                     })
                     .and_then(|res| sink.success(res).map_err(Error::from))
-                    .map(|_| ())
+                    .map(|_| timer.observe_duration())
                     .map_err(|e| error!("kv_scan failed: {:?}", e))
             })
     }
@@ -146,7 +146,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                    _: RpcContext,
                    mut req: PrewriteRequest,
                    sink: UnarySink<PrewriteResponse>) {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+        let timer = GRPC_MSG_HISTOGRAM_VEC.with_label_values(&["kv_prewrite"]).start_timer();
 
         let storage = self.storage.clone();
         self.core.spawn(move |_| {
@@ -183,13 +183,13 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     resp
                 })
                 .and_then(|res| sink.success(res).map_err(Error::from))
-                .map(|_| ())
+                .map(|_| timer.observe_duration())
                 .map_err(|e| error!("kv_prewrite failed: {:?}", e))
         });
     }
 
     fn kv_commit(&self, _: RpcContext, mut req: CommitRequest, sink: UnarySink<CommitResponse>) {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+        let timer = GRPC_MSG_HISTOGRAM_VEC.with_label_values(&["kv_commit"]).start_timer();
 
         let storage = self.storage.clone();
         self.core.spawn(move |_| {
@@ -213,7 +213,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     resp
                 })
                 .and_then(|res| sink.success(res).map_err(Error::from))
-                .map(|_| ())
+                .map(|_| timer.observe_duration())
                 .map_err(|e| error!("kv_commit failed: {:?}", e))
         });
     }
@@ -222,7 +222,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                   _: RpcContext,
                   mut req: CleanupRequest,
                   sink: UnarySink<CleanupResponse>) {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+        let timer = GRPC_MSG_HISTOGRAM_VEC.with_label_values(&["kv_cleanup"]).start_timer();
 
         let storage = self.storage.clone();
         self.core.spawn(move |_| {
@@ -247,7 +247,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     resp
                 })
                 .and_then(|res| sink.success(res).map_err(Error::from))
-                .map(|_| ())
+                .map(|_| timer.observe_duration())
                 .map_err(|e| error!("kv_cleanup failed: {:?}", e))
         });
     }
@@ -256,7 +256,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     _: RpcContext,
                     mut req: BatchGetRequest,
                     sink: UnarySink<BatchGetResponse>) {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+        let timer = GRPC_MSG_HISTOGRAM_VEC.with_label_values(&["kv_batch_get"]).start_timer();
         let storage = self.storage.clone();
         self.core.spawn(move |_| {
             let keys = req.get_keys().into_iter().map(|x| Key::from_raw(x)).collect();
@@ -275,7 +275,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     resp
                 })
                 .and_then(|res| sink.success(res).map_err(Error::from))
-                .map(|_| ())
+                .map(|_| timer.observe_duration())
                 .map_err(|e| error!("kv_batch_get failed: {:?}", e))
         });
     }
@@ -284,7 +284,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                          _: RpcContext,
                          mut req: BatchRollbackRequest,
                          sink: UnarySink<BatchRollbackResponse>) {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+        let timer = GRPC_MSG_HISTOGRAM_VEC.with_label_values(&["kv_batch_rollback"]).start_timer();
 
         let storage = self.storage.clone();
         self.core.spawn(move |_| {
@@ -304,7 +304,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     resp
                 })
                 .and_then(|res| sink.success(res).map_err(Error::from))
-                .map(|_| ())
+                .map(|_| timer.observe_duration())
                 .map_err(|e| error!("kv_batch_rollback failed: {:?}", e))
         });
     }
@@ -313,7 +313,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     _: RpcContext,
                     mut req: ScanLockRequest,
                     sink: UnarySink<ScanLockResponse>) {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+        let timer = GRPC_MSG_HISTOGRAM_VEC.with_label_values(&["kv_scan_lock"]).start_timer();
 
         let storage = self.storage.clone();
         self.core.spawn(move |_| {
@@ -334,7 +334,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     resp
                 })
                 .and_then(|res| sink.success(res).map_err(Error::from))
-                .map(|_| ())
+                .map(|_| timer.observe_duration())
                 .map_err(|e| error!("kv_scan_lock failed: {:?}", e))
         });
     }
@@ -343,7 +343,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                        _: RpcContext,
                        mut req: ResolveLockRequest,
                        sink: UnarySink<ResolveLockResponse>) {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+        let timer = GRPC_MSG_HISTOGRAM_VEC.with_label_values(&["kv_resolve_lock"]).start_timer();
 
         let storage = self.storage.clone();
         self.core.spawn(move |_| {
@@ -366,13 +366,13 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     resp
                 })
                 .and_then(|res| sink.success(res).map_err(Error::from))
-                .map(|_| ())
+                .map(|_| timer.observe_duration())
                 .map_err(|e| error!("kv_resolve_lock failed: {:?}", e))
         });
     }
 
     fn kv_gc(&self, _: RpcContext, mut req: GCRequest, sink: UnarySink<GCResponse>) {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+        let timer = GRPC_MSG_HISTOGRAM_VEC.with_label_values(&["kv_gc"]).start_timer();
 
         let storage = self.storage.clone();
         self.core.spawn(move |_| {
@@ -389,13 +389,13 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     resp
                 })
                 .and_then(|res| sink.success(res).map_err(Error::from))
-                .map(|_| ())
+                .map(|_| timer.observe_duration())
                 .map_err(|e| error!("kv_gc failed: {:?}", e))
         });
     }
 
     fn raw_get(&self, _: RpcContext, mut req: RawGetRequest, sink: UnarySink<RawGetResponse>) {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+        let timer = GRPC_MSG_HISTOGRAM_VEC.with_label_values(&["raw_get"]).start_timer();
 
         let storage = self.storage.clone();
         self.core.spawn(move |_| {
@@ -416,13 +416,13 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     resp
                 })
                 .and_then(|res| sink.success(res).map_err(Error::from))
-                .map(|_| ())
+                .map(|_| timer.observe_duration())
                 .map_err(|e| error!("raw_get failed: {:?}", e))
         });
     }
 
     fn raw_put(&self, _: RpcContext, mut req: RawPutRequest, sink: UnarySink<RawPutResponse>) {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+        let timer = GRPC_MSG_HISTOGRAM_VEC.with_label_values(&["raw_put"]).start_timer();
 
         let storage = self.storage.clone();
         self.core.spawn(move |_| {
@@ -440,7 +440,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     resp
                 })
                 .and_then(|res| sink.success(res).map_err(Error::from))
-                .map(|_| ())
+                .map(|_| timer.observe_duration())
                 .map_err(|e| error!("raw_put failed: {:?}", e))
         });
     }
@@ -449,7 +449,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                   _: RpcContext,
                   mut req: RawDeleteRequest,
                   sink: UnarySink<RawDeleteResponse>) {
-        RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
+        let timer = GRPC_MSG_HISTOGRAM_VEC.with_label_values(&["raw_delete"]).start_timer();
 
         let storage = self.storage.clone();
         self.core.spawn(move |_| {
@@ -466,13 +466,13 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     resp
                 })
                 .and_then(|res| sink.success(res).map_err(Error::from))
-                .map(|_| ())
+                .map(|_| timer.observe_duration())
                 .map_err(|e| error!("raw_delete failed: {:?}", e))
         });
     }
 
     fn coprocessor(&self, _: RpcContext, req: Request, sink: UnarySink<Response>) {
-        RECV_MSG_COUNTER.with_label_values(&["coprocessor"]).inc();
+        let timer = GRPC_MSG_HISTOGRAM_VEC.with_label_values(&["coprocessor"]).start_timer();
 
         let end_point_scheduler = self.end_point_scheduler.clone();
         self.core.spawn(move |_| {
@@ -480,7 +480,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
             end_point_scheduler.schedule(EndPointTask::Request(RequestTask::new(req, cb))).unwrap();
             future.map_err(Error::from)
                 .and_then(|res| sink.success(res).map_err(Error::from))
-                .map(|_| ())
+                .map(|_| timer.observe_duration())
                 .map_err(|e| error!("coprocessor failed: {:?}", e))
         });
     }

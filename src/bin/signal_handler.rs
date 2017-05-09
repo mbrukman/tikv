@@ -31,7 +31,7 @@ mod imp {
 
     const PROFILE_SLEEP_SEC: u64 = 30;
 
-    pub fn handle_signal(ch: SendCh<Msg>, engine: Arc<DB>, _: &str) {
+    pub fn handle_signal(ch: SendCh<Msg>, engine: Arc<DB>) {
         use signal::trap::Trap;
         use nix::sys::signal::{SIGTERM, SIGINT, SIGUSR1, SIGUSR2};
         let trap = Trap::trap(&[SIGTERM, SIGINT, SIGUSR1, SIGUSR2]);

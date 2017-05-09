@@ -379,7 +379,8 @@ impl Conn {
         let channel = ChannelBuilder::new(env).connect(&format!("{}", addr));
         let client = TikvClient::new(channel);
         let (tx, rx) = mpsc::unbounded();
-        handle.spawn(client.raft().sink_map_err(Error::from)
+        handle.spawn(client.raft()
+            .sink_map_err(Error::from)
             .send_all(rx.map_err(|_| Error::Sink))
             .map(|_| ())
             .map_err(|e| error!("send raftmessage failed: {:?}", e)));

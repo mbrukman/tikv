@@ -103,9 +103,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     }
                     res
                 })
-                .and_then(|res| {
-                    sink.success(res).map_err(Error::from)
-                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
                 .map(|_| ())
                 .map_err(|e| error!("kv_get failed: {:?}", e))
         });
@@ -138,9 +136,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                         }
                         resp
                     })
-                    .and_then(|res| {
-                        sink.success(res).map_err(Error::from)
-                    })
+                    .and_then(|res| sink.success(res).map_err(Error::from))
                     .map(|_| ())
                     .map_err(|e| error!("kv_scan failed: {:?}", e))
             })
@@ -186,18 +182,13 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     }
                     resp
                 })
-                .and_then(|res| {
-                    sink.success(res).map_err(Error::from)
-                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
                 .map(|_| ())
                 .map_err(|e| error!("kv_prewrite failed: {:?}", e))
         });
     }
 
-    fn kv_commit(&self,
-                 _: RpcContext,
-                 mut req: CommitRequest,
-                 sink: UnarySink<CommitResponse>) {
+    fn kv_commit(&self, _: RpcContext, mut req: CommitRequest, sink: UnarySink<CommitResponse>) {
         RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
 
         let storage = self.storage.clone();
@@ -221,9 +212,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     }
                     resp
                 })
-                .and_then(|res| {
-                    sink.success(res).map_err(Error::from)
-                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
                 .map(|_| ())
                 .map_err(|e| error!("kv_commit failed: {:?}", e))
         });
@@ -257,9 +246,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     }
                     resp
                 })
-                .and_then(|res| {
-                    sink.success(res).map_err(Error::from)
-                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
                 .map(|_| ())
                 .map_err(|e| error!("kv_cleanup failed: {:?}", e))
         });
@@ -287,9 +274,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     }
                     resp
                 })
-                .and_then(|res| {
-                    sink.success(res).map_err(Error::from)
-                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
                 .map(|_| ())
                 .map_err(|e| error!("kv_batch_get failed: {:?}", e))
         });
@@ -318,9 +303,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     }
                     resp
                 })
-                .and_then(|res| {
-                    sink.success(res).map_err(Error::from)
-                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
                 .map(|_| ())
                 .map_err(|e| error!("kv_batch_rollback failed: {:?}", e))
         });
@@ -350,9 +333,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     }
                     resp
                 })
-                .and_then(|res| {
-                    sink.success(res).map_err(Error::from)
-                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
                 .map(|_| ())
                 .map_err(|e| error!("kv_scan_lock failed: {:?}", e))
         });
@@ -384,9 +365,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     }
                     resp
                 })
-                .and_then(|res| {
-                    sink.success(res).map_err(Error::from)
-                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
                 .map(|_| ())
                 .map_err(|e| error!("kv_resolve_lock failed: {:?}", e))
         });
@@ -409,18 +388,13 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     }
                     resp
                 })
-                .and_then(|res| {
-                    sink.success(res).map_err(Error::from)
-                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
                 .map(|_| ())
                 .map_err(|e| error!("kv_gc failed: {:?}", e))
         });
     }
 
-    fn raw_get(&self,
-               _: RpcContext,
-               mut req: RawGetRequest,
-               sink: UnarySink<RawGetResponse>) {
+    fn raw_get(&self, _: RpcContext, mut req: RawGetRequest, sink: UnarySink<RawGetResponse>) {
         RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
 
         let storage = self.storage.clone();
@@ -441,18 +415,13 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     }
                     resp
                 })
-                .and_then(|res| {
-                    sink.success(res).map_err(Error::from)
-                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
                 .map(|_| ())
                 .map_err(|e| error!("raw_get failed: {:?}", e))
         });
     }
 
-    fn raw_put(&self,
-               _: RpcContext,
-               mut req: RawPutRequest,
-               sink: UnarySink<RawPutResponse>) {
+    fn raw_put(&self, _: RpcContext, mut req: RawPutRequest, sink: UnarySink<RawPutResponse>) {
         RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
 
         let storage = self.storage.clone();
@@ -470,9 +439,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     }
                     resp
                 })
-                .and_then(|res| {
-                    sink.success(res).map_err(Error::from)
-                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
                 .map(|_| ())
                 .map_err(|e| error!("raw_put failed: {:?}", e))
         });
@@ -498,9 +465,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     }
                     resp
                 })
-                .and_then(|res| {
-                    sink.success(res).map_err(Error::from)
-                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
                 .map(|_| ())
                 .map_err(|e| error!("raw_delete failed: {:?}", e))
         });
@@ -514,9 +479,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
             let (cb, future) = make_callback();
             end_point_scheduler.schedule(EndPointTask::Request(RequestTask::new(req, cb))).unwrap();
             future.map_err(Error::from)
-                .and_then(|res| {
-                    sink.success(res).map_err(Error::from)
-                })
+                .and_then(|res| sink.success(res).map_err(Error::from))
                 .map(|_| ())
                 .map_err(|e| error!("coprocessor failed: {:?}", e))
         });
@@ -567,9 +530,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                     };
                     future::result(res.map_err(Error::from))
                 })
-                .and_then(|_| {
-                    sink.success(Done::new()).map_err(Error::from)
-                })
+                .and_then(|_| sink.success(Done::new()).map_err(Error::from))
                 .then(|_| future::ok(()))
         });
     }

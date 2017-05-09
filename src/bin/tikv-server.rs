@@ -792,22 +792,31 @@ fn start_server<T, S>(mut server: Server<T, S>,
                       mut el: EventLoop<Server<T, S>>,
                       mut core: Core,
                       engine: Arc<DB>,
-                      backup_path: &str)
+                      _: &str)
     where T: RaftStoreRouter,
           S: StoreAddrResolver + Send + 'static
 {
     let ch = server.get_sendch();
+    let signal_handle = thread::Builder::new()
+        .name("signal-handler".to_owned())
+        .spawn(move || {
+            signal_handler::handle_signal(ch, engine);
+        })
+        .unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
+
     let (tx, rx) = oneshot::channel();
-    let h = thread::Builder::new()
+    let tikv_handle = thread::Builder::new()
         .name("tikv-eventloop".to_owned())
         .spawn(move || {
             server.run(&mut el).unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
             tx.send(()).unwrap();
         })
         .unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
+
     core.run(rx).unwrap();
-    signal_handler::handle_signal(ch, engine, backup_path);
-    h.join().unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
+
+    signal_handle.join().unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
+    tikv_handle.join().unwrap_or_else(|err| exit_with_err(format!("{:?}", err)));
 }
 
 fn run_raft_server(pd_client: RpcClient,

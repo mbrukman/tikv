@@ -11,21 +11,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::boxed::Box;
 use std::net::{SocketAddr, IpAddr};
 use std::str::FromStr;
-use futures::sync::mpsc;
-use futures::{Stream, Future, Sink};
-use tokio_core::reactor::{Handle as CoreHandle, Remote as RemoteCore};
+use tokio_core::reactor::Remote as RemoteCore;
 use mio::{Handler, EventLoop, EventLoopConfig};
-use grpc::{Server as GrpcServer, ServerBuilder, Environment, ChannelBuilder};
+use grpc::{Server as GrpcServer, ServerBuilder, Environment};
 use kvproto::tikvpb_grpc::*;
-use kvproto::raft_serverpb::*;
 use util::worker::{Stopped, Worker};
-use util::worker::{FutureWorker, FutureRunnable};
+use util::worker::FutureWorker;
 use util::transport::SendCh;
 use storage::Storage;
 use raftstore::store::{SnapshotStatusMsg, SnapManager};
@@ -34,12 +30,13 @@ use util::collections::{HashMap, HashSet};
 
 use super::coprocessor::{EndPointTask, EndPointHost};
 use super::{Msg, ConnData};
-use super::{Result, Config, Error};
+use super::{Result, Config};
 use super::grpc_service::Service;
 use super::transport::RaftStoreRouter;
 use super::resolve::StoreAddrResolver;
 use super::snap::{Task as SnapTask, Runner as SnapHandler};
 use super::metrics::*;
+use super::raft_send::{SendTask, SendRunner};
 
 const DEFAULT_COPROCESSOR_BATCH: usize = 50;
 
@@ -356,81 +353,6 @@ impl SnapshotReporter {
         }
     }
 }
-
-// SendTask delivers a raft message to other store.
-pub struct SendTask {
-    pub addr: SocketAddr,
-    pub msg: RaftMessage,
-}
-
-impl fmt::Display for SendTask {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "send raft message to {:?}", self.addr)
-    }
-}
-
-struct Conn {
-    _client: TikvClient,
-    stream: mpsc::UnboundedSender<RaftMessage>,
-}
-
-impl Conn {
-    fn new(env: Arc<Environment>, addr: SocketAddr, handle: &CoreHandle) -> Result<Conn> {
-        let channel = ChannelBuilder::new(env).connect(&format!("{}", addr));
-        let client = TikvClient::new(channel);
-        let (tx, rx) = mpsc::unbounded();
-        handle.spawn(client.raft()
-            .sink_map_err(Error::from)
-            .send_all(rx.map_err(|_| Error::Sink))
-            .map(|_| ())
-            .map_err(|e| error!("send raftmessage failed: {:?}", e)));
-        Ok(Conn {
-            _client: client,
-            stream: tx,
-        })
-    }
-}
-
-// SendRunner is used for sending raft messages to other stores.
-pub struct SendRunner {
-    env: Arc<Environment>,
-    conns: HashMap<SocketAddr, Conn>,
-}
-
-impl SendRunner {
-    pub fn new(env: Arc<Environment>) -> SendRunner {
-        SendRunner {
-            env: env,
-            conns: HashMap::default(),
-        }
-    }
-
-    fn get_conn(&mut self, addr: SocketAddr, handle: &CoreHandle) -> Result<&Conn> {
-        // TDOO: handle Conn::new() error.
-        let env = self.env.clone();
-        let conn = self.conns
-            .entry(addr)
-            .or_insert_with(|| Conn::new(env.clone(), addr, handle).unwrap());
-        Ok(conn)
-    }
-
-    fn send(&mut self, t: SendTask, handle: &CoreHandle) -> Result<()> {
-        let conn = try!(self.get_conn(t.addr, handle));
-        box_try!(mpsc::UnboundedSender::send(&conn.stream, t.msg));
-        Ok(())
-    }
-}
-
-impl FutureRunnable<SendTask> for SendRunner {
-    fn run(&mut self, t: SendTask, handle: &CoreHandle) {
-        let addr = t.addr;
-        if let Err(e) = self.send(t, handle) {
-            error!("send raft message error: {:?}", e);
-            self.conns.remove(&addr);
-        }
-    }
-}
-
 
 #[cfg(test)]
 mod tests {

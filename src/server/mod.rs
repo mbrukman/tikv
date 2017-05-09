@@ -24,6 +24,7 @@ use kvproto::raft_serverpb::RaftMessage;
 use kvproto::coprocessor::Response;
 mod metrics;
 mod grpc_service;
+mod raft_send;
 
 pub mod config;
 pub mod errors;

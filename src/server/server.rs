@@ -102,7 +102,7 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
                              end_point_worker.scheduler(),
                              ch.raft_router.clone(),
                              snap_worker.scheduler());
-        let env = Arc::new(Environment::new(1));
+        let env = Arc::new(Environment::new(cfg.grpc_concurrency));
         let addr = try!(SocketAddr::from_str(&cfg.addr));
         let ip = format!("{}", addr.ip());
         let mut grpc_server = ServerBuilder::new(env.clone())

@@ -38,7 +38,7 @@ use super::metrics::*;
 use super::Error;
 
 #[derive(Clone)]
-pub struct Handle<T: RaftStoreRouter + 'static> {
+pub struct Service<T: RaftStoreRouter + 'static> {
     core: Remote,
     // For handling KV requests.
     storage: Storage,
@@ -51,14 +51,14 @@ pub struct Handle<T: RaftStoreRouter + 'static> {
     token: Arc<AtomicUsize>, // TODO: remove it.
 }
 
-impl<T: RaftStoreRouter + 'static> Handle<T> {
+impl<T: RaftStoreRouter + 'static> Service<T> {
     pub fn new(core: Remote,
                storage: Storage,
                end_point_scheduler: Scheduler<EndPointTask>,
                ch: T,
                snap_scheduler: Scheduler<SnapTask>)
-               -> Handle<T> {
-        Handle {
+               -> Service<T> {
+        Service {
             core: core,
             storage: storage,
             end_point_scheduler: end_point_scheduler,
@@ -77,7 +77,7 @@ fn make_callback<T: Debug + Send + 'static>() -> (Box<FnBox(T) + Send>, oneshot:
     (box callback, rx)
 }
 
-impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Handle<T> {
+impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
     fn kv_get(&self, _: RpcContext, mut req: GetRequest, sink: UnarySink<GetResponse>) {
         RECV_MSG_COUNTER.with_label_values(&["kv"]).inc();
 

@@ -35,7 +35,7 @@ use util::collections::{HashMap, HashSet};
 use super::coprocessor::{EndPointTask, EndPointHost};
 use super::{Msg, ConnData};
 use super::{Result, Config, Error};
-use super::handle::Handle;
+use super::grpc_service::Service;
 use super::transport::RaftStoreRouter;
 use super::resolve::StoreAddrResolver;
 use super::snap::{Task as SnapTask, Runner as SnapHandler};
@@ -100,11 +100,11 @@ impl<T: RaftStoreRouter, S: StoreAddrResolver> Server<T, S> {
         let snap_worker = Worker::new("snap-handler");
         let raft_msg_worker = FutureWorker::new("raft-msg-worker");
 
-        let h = Handle::new(core,
-                            storage.clone(),
-                            end_point_worker.scheduler(),
-                            ch.raft_router.clone(),
-                            snap_worker.scheduler());
+        let h = Service::new(core,
+                             storage.clone(),
+                             end_point_worker.scheduler(),
+                             ch.raft_router.clone(),
+                             snap_worker.scheduler());
         let env = Arc::new(Environment::new(1));
         let addr = try!(SocketAddr::from_str(&cfg.addr));
         let ip = format!("{}", addr.ip());

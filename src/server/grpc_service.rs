@@ -31,6 +31,9 @@ use kvproto::errorpb::{Error as RegionError, ServerIsBusy};
 use util::worker::Scheduler;
 use util::buf::PipeBuffer;
 use storage::{self, Storage, Key, Options, Mutation};
+use storage::txn::Error as TxnError;
+use storage::mvcc::Error as MvccError;
+use storage::engine::Error as EngineError;
 use super::transport::RaftStoreRouter;
 use super::coprocessor::{RequestTask, EndPointTask};
 use super::snap::Task as SnapTask;
@@ -536,10 +539,6 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
     }
 }
 
-use storage::txn::Error as TxnError;
-use storage::mvcc::Error as MvccError;
-use storage::engine::Error as EngineError;
-
 fn extract_region_error<T>(res: &storage::Result<T>) -> Option<RegionError> {
     use storage::Error;
     match *res {
@@ -593,45 +592,42 @@ fn extract_key_error(err: &storage::Error) -> KeyError {
 }
 
 fn extract_kv_pairs(res: storage::Result<Vec<storage::Result<storage::KvPair>>>) -> Vec<KvPair> {
-    let mut pairs = vec![];
     match res {
         Ok(res) => {
-            for r in res {
-                let mut pair = KvPair::new();
-                match r {
+            res.into_iter()
+                .map(|r| match r {
                     Ok((key, value)) => {
+                        let mut pair = KvPair::new();
                         pair.set_key(key);
                         pair.set_value(value);
+                        pair
                     }
                     Err(e) => {
+                        let mut pair = KvPair::new();
                         pair.set_error(extract_key_error(&e));
+                        pair
                     }
-                }
-                pairs.push(pair);
-            }
+                })
+                .collect()
         }
         Err(e) => {
             let mut pair = KvPair::new();
             pair.set_error(extract_key_error(&e));
-            pairs.push(pair);
+            vec![pair]
         }
     }
-    pairs
 }
 
 fn extract_key_errors(res: storage::Result<Vec<storage::Result<()>>>) -> Vec<KeyError> {
-    let mut errs = vec![];
     match res {
         Ok(res) => {
-            for r in res {
-                if let Err(e) = r {
-                    errs.push(extract_key_error(&e));
-                }
-            }
+            res.into_iter()
+                .filter_map(|x| match x {
+                    Err(e) => Some(extract_key_error(&e)),
+                    Ok(_) => None,
+                })
+                .collect()
         }
-        Err(e) => {
-            errs.push(extract_key_error(&e));
-        }
+        Err(e) => vec![extract_key_error(&e)],
     }
-    errs
 }

@@ -17,13 +17,17 @@ mod imp {
     use std::time::Duration;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::io;
 
+    use libc::{SIGTERM, SIGINT, SIGUSR1, SIGUSR2};
+    use futures::Stream;
+    use tokio_core::reactor::Core;
+    use tokio_signal::unix::Signal;
     use rocksdb::DB;
 
     use tikv::server::Msg;
     use tikv::util::transport::SendCh;
     use prometheus::{self, Encoder, TextEncoder};
-
     use profiling;
 
     const ROCKSDB_DB_STATS_KEY: &'static str = "rocksdb.dbstats";
@@ -32,16 +36,22 @@ mod imp {
     const PROFILE_SLEEP_SEC: u64 = 30;
 
     pub fn handle_signal(ch: SendCh<Msg>, engine: Arc<DB>) {
-        use signal::trap::Trap;
-        use nix::sys::signal::{SIGTERM, SIGINT, SIGUSR1, SIGUSR2};
-        let trap = Trap::trap(&[SIGTERM, SIGINT, SIGUSR1, SIGUSR2]);
+        let mut core = Core::new().unwrap();
+        let handle = core.handle();
+
+        let stream = core.run(Signal::new(SIGTERM, &handle)).unwrap()
+        .select(core.run(Signal::new(SIGINT, &handle)).unwrap())
+        .select(core.run(Signal::new(SIGUSR1, &handle)).unwrap())
+        .select(core.run(Signal::new(SIGUSR2, &handle)).unwrap());
+
         let profiling_memory = Arc::new(AtomicBool::new(false));
-        for sig in trap {
-            match sig {
+
+        let res = core.run(stream.for_each(|signal| {
+            match signal {
                 SIGTERM | SIGINT => {
-                    info!("receive signal {}, stopping server...", sig);
+                    info!("receive signal {}, stopping server...", signal);
                     ch.send(Msg::Quit).unwrap();
-                    break;
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted"));
                 }
                 SIGUSR1 => {
                     // Use SIGUSR1 to log metrics.
@@ -55,7 +65,7 @@ mod imp {
                     for name in engine.cf_names() {
                         let handler = engine.cf_handle(name).unwrap();
                         if let Some(v) =
-                               engine.get_property_value_cf(handler, ROCKSDB_CF_STATS_KEY) {
+                        engine.get_property_value_cf(handler, ROCKSDB_CF_STATS_KEY) {
                             info!("{}", v)
                         }
                     }
@@ -74,10 +84,14 @@ mod imp {
                                               &profiling_memory,
                                               Duration::from_secs(PROFILE_SLEEP_SEC));
                 }
-                // TODO: handle more signal
-                _ => unreachable!(),
+                _ => {
+                    // TODO: handle more signals.
+                }
             }
-        }
+            Ok(())
+        }));
+
+        println!("signal-handler quit: {:?}", res);
     }
 }
 

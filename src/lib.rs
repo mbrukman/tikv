@@ -67,6 +67,7 @@ extern crate ordermap;
 extern crate futures;
 extern crate tokio_core;
 extern crate tokio_timer;
+extern crate tokio_signal;
 
 #[macro_use]
 pub mod util;

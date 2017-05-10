@@ -31,13 +31,12 @@ extern crate toml;
 extern crate libc;
 extern crate fs2;
 #[cfg(unix)]
-extern crate signal;
-#[cfg(unix)]
 extern crate nix;
 extern crate prometheus;
 extern crate sys_info;
 extern crate futures;
 extern crate tokio_core;
+extern crate tokio_signal;
 #[cfg(test)]
 extern crate tempdir;
 

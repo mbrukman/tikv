@@ -600,10 +600,14 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
             _: RpcContext,
             stream: RequestStream<RaftMessage>,
             _: ClientStreamingSink<Done>) {
+	error!("hehe <-- new conn");
         let ch = self.ch.clone();
         self.pool
             .spawn(stream.map_err(Error::from)
-                .for_each(move |msg| future::result(ch.send_raft_msg(msg)).map_err(Error::from))
+                .for_each(move |msg| {
+		     error!("hehe <-- {:?}", msg.get_from_peer());
+                     future::result(ch.send_raft_msg(msg)).map_err(Error::from)
+                })
                 .then(|_| future::ok::<_, ()>(())))
             .forget();
     }

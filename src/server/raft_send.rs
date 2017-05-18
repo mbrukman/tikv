@@ -45,14 +45,18 @@ struct Conn {
 
 impl Conn {
     fn new(env: Arc<Environment>, addr: SocketAddr, handle: &Handle) -> Conn {
+	error!("hehe new conn --> {}", addr);
         let channel = ChannelBuilder::new(env).connect(&format!("{}", addr));
         let client = TikvClient::new(channel);
         let (tx, rx) = mpsc::unbounded();
         handle.spawn(client.raft()
             .sink_map_err(Error::from)
-            .send_all(rx.map_err(|_| Error::Sink))
+            .send_all(rx.map(|x: RaftMessage| {
+               error!("hehe stream recv, to: {:?}", x.get_to_peer());
+               x
+	    }).map_err(|_| Error::Sink))
             .map(|_| ())
-            .map_err(move |e| error!("send raftmessage to {} failed: {:?}", addr, e)));
+            .map_err(move |e| error!("hehe-->{} stream error: {:?}", addr, e)));
         Conn {
             _client: client,
             stream: tx,
@@ -84,6 +88,7 @@ impl SendRunner {
     fn send(&mut self, t: SendTask, handle: &Handle) -> Result<()> {
         let conn = self.get_conn(t.addr, handle);
         box_try!(UnboundedSender::send(&conn.stream, t.msg));
+	error!("hehe--> {} ok.", t.addr);
         Ok(())
     }
 }
@@ -91,8 +96,8 @@ impl SendRunner {
 impl FutureRunnable<SendTask> for SendRunner {
     fn run(&mut self, t: SendTask, handle: &Handle) {
         let addr = t.addr;
-        if let Err(e) = self.send(t, handle) {
-            error!("send raft message error: {:?}", e);
+        if let Err(_) = self.send(t, handle) {
+	    error!("hehe-->{} fail, remove conn.", addr);
             self.conns.remove(&addr);
         }
     }

@@ -183,7 +183,7 @@ enum RequestPolicy {
 pub struct Peer {
     engine: Arc<DB>,
     cfg: Rc<Config>,
-    peer_cache: Rc<RefCell<FlatMap<u64, metapb::Peer>>>,
+    peer_cache: RefCell<FlatMap<u64, metapb::Peer>>,
     pub peer: metapb::Peer,
     region_id: u64,
     pub raft_group: RawNode<PeerStorage>,
@@ -308,7 +308,7 @@ impl Peer {
             raft_group: raft_group,
             proposals: Default::default(),
             pending_reads: Default::default(),
-            peer_cache: Rc::new(RefCell::new(peer_cache)),
+            peer_cache: RefCell::new(peer_cache),
             peer_heartbeats: FlatMap::default(),
             coprocessor_host: store.coprocessor_host.clone(),
             size_diff_hint: 0,
